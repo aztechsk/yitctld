@@ -1,0 +1,3860 @@
+#!/usr/bin/perl
+
+# yitctld, v1.04.
+#
+# Copyright (c) 2018 Jan Rusnak <jan@rusnak.sk>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use Inline (Config => DIRECTORY => '/usr/local/lib/yitctld/');
+use Inline (C => 'DATA');
+use Inline (C => 'DATA', LIBS => '-lsystemd');
+use warnings;
+use strict;
+use re '/aa';
+use Getopt::Std;
+use Socket;
+use Sys::Proctitle qw(:all);
+use IO::File;
+use Fcntl qw(:DEFAULT :mode :flock);
+use POSIX qw(isatty pause setsid);
+use Time::HiRes qw(usleep clock_gettime CLOCK_MONOTONIC);
+use Errno qw(EAGAIN EINTR);
+use feature qw(state);
+
+use constant {
+	FALSE => 0,
+	TRUE  => 1,
+};
+
+use constant {
+	PARENT_PROCESS => 0,
+	CHILD_PROCESS  => 1,
+};
+
+use constant {
+	UNIX_SOCKET => 0,
+	INET_SOCKET => 1,
+};
+
+use constant {
+	SOCKET_READ_BYTES => 64,
+};
+
+use constant {
+	TIME_PASS_EVENT => 0,
+	RECV_MESG_EVENT => 1,
+};
+
+use constant {
+	DATA_CRC_INIT => 0xFF,
+};
+
+use constant {
+	RECV_MESG_DATA_POS => 37,
+};
+
+use constant {
+	MAIN_LOOP_SELECT_S_TMO => 0.2,
+	INIT_RST_WAIT_S_TMO    => 1,
+	NEXT_RST_WAIT_S_TMO    => 5,
+        RST_RPL_S_TMO          => 3,
+	GEN_RPL_S_TMO          => 20,
+	NET_ID_IND_S_TMO       => 180,
+	BCAST_PERIOD_S_TMO     => 120,
+	TXP_DELAY_S_TMO        => 2,
+	UCAST_SCHED_TMO        => 2.5,
+	UCAST_SESSION_TMO      => 25,
+};
+
+use constant {
+	MESG_LOG_COLS => 16,
+};
+
+use constant {
+	MESG_DIR_SEND => 0,
+	MESG_DIR_RECV => 1,
+};
+
+use constant {
+	MESG_FLAG => 0xCA,
+};
+
+use constant {
+	MESG_WAIT_FLAG   => 0,
+	MESG_WAIT_SZ_LSB => 1,
+	MESG_WAIT_SZ_MSB => 2,
+	MESG_RCV_DATA    => 3,
+	MESG_RCV_SUM     => 4,
+};
+
+my %mesg_recv_state_txt = (
+	0 => 'MESG_WAIT_FLAG',
+	1 => 'MESG_WAIT_SZ_LSB',
+	2 => 'MESG_WAIT_SZ_MSB',
+	3 => 'MESG_RCV_DATA',
+	4 => 'MESG_RCV_SUM',
+);
+
+use constant {
+	MIN_MESG_SIZE => 2,
+	MAX_MESG_SIZE => 1486,
+};
+
+use constant {
+	YIT_OP_BAND_FCC   => 0,
+	YIT_OP_BAND_CA    => 2,
+	YIT_OP_BAND_CB    => 3,
+	YIT_OP_BAND_CA3   => 4,
+	YIT_OP_BAND_ARIB  => 128,
+};
+
+use constant {
+	YIT_REGION_FCC   => 0,
+	YIT_REGION_ARIB  => 1,
+	YIT_REGION_CA    => 2,
+	YIT_REGION_CB    => 3,
+	YIT_REGION_CA3   => 4,
+	YIT_REGION_DFLT  => 0xFF,
+};
+
+use constant {
+	YIT_NO_OPERATION                     => 0x00,
+	YIT_GET_VERSION                      => 0x01,
+	YIT_GET_FREE_MEMORY                  => 0x02,
+	YIT_READ_FROM_NVM                    => 0x05,
+	YIT_WRITE_TO_NVM                     => 0x06,
+	YIT_RESET                            => 0x20,
+	YIT_GO_ONLINE                        => 0x22,
+	YIT_GO_OFFLINE                       => 0x23,
+	YIT_SET_PREDEFINED_PARAMETERS        => 0x40,
+	YIT_SET_DEVICE_PARAMETERS            => 0x41,
+	YIT_GET_DEVICE_PARAMETERS            => 0x42,
+	YIT_SAVE_DEVICE_PARAMETERS           => 0x43,
+	YIT_REMOTE_PARAMETERS_CHANGED        => 0x4C,
+	YIT_TX_PACKET                        => 0x60,
+	YIT_GET_NC_DATABASE_SIZE             => 0x65,
+	YIT_RX_PACKET                        => 0x68,
+	YIT_GET_NODE_INFORMATION             => 0x69,
+	YIT_DELETE_NODE_INFORMATION          => 0x6A,
+	YIT_ADMISSION_APPROVAL_RESP_FROM_APP => 0xA4,
+	YIT_LEAVE_NETWORK                    => 0xA6,
+	YIT_CONNECTIVITY_STATUS_WITH_RS      => 0xB1,
+	YIT_NODE_LEFT_NETWORK                => 0xB3,
+	YIT_GET_ADMISSION_APPROVAL_FROM_APP  => 0xB8,
+	YIT_ADMISSION_REFUSE                 => 0xB9,
+	YIT_CONNECTED_TO_NC                  => 0xBA,
+	YIT_DISCONNECTED_FROM_NC             => 0xBB,
+	YIT_NEW_CONNECTION_TO_NC             => 0xBE,
+	YIT_NETWORK_ID_ASSIGNED              => 0xBF,
+};
+
+my %yit_command_txt = (
+	0x00 => 'NO_OPERATION',
+	0x01 => 'GET_VERSION',
+	0x02 => 'GET_FREE_MEMORY',
+	0x05 => 'READ_FROM_NVM',
+	0x06 => 'WRITE_TO_NVM',
+	0x20 => 'RESET',
+	0x22 => 'GO_ONLINE',
+	0x23 => 'GO_OFFLINE',
+	0x40 => 'SET_PREDEF_PARAMETERS',
+	0x41 => 'SET_DEVICE_PARAMETERS',
+	0x42 => 'GET_DEVICE_PARAMETERS',
+	0x43 => 'SAVE_DEVICE_PARAMETERS',
+	0x4C => 'REMOTE_PARAM_CHANGED',
+	0x60 => 'TX_PACKET',
+	0x65 => 'GET_NC_DATABASE_SIZE',
+	0x68 => 'RX_PACKET',
+	0x69 => 'GET_NODE_INFORMATION',
+	0x6A => 'DELETE_NODE_INFORMATION',
+	0xA4 => 'ADM_APPR_RESP_FROM_APP',
+	0xA6 => 'LEAVE_NETWORK',
+	0xB1 => 'CONNECT_STATUS_WITH_RS',
+	0xB3 => 'NODE_LEFT_NETWORK',
+	0xB8 => 'GET_ADM_APPR_FROM_APP',
+	0xB9 => 'ADMISSION_REFUSE',
+	0xBA => 'CONNECTED_TO_NC',
+	0xBB => 'DISCONNECTED_FROM_NC',
+	0xBE => 'NEW_CONNECTION_TO_NC',
+	0xBF => 'NETWORK_ID_ASSIGNED',
+);
+
+use constant {
+	YIT_REQUEST    => 0,
+	YIT_RESPONSE   => 1,
+	YIT_INDICATION => 2,
+};
+
+my %yit_mesg_type_txt = (
+	0 => '<c',
+	1 => 'r>',
+        2 => 'i>',
+);
+
+use constant {
+	YIT_NODE_INFO_BY_NC_DB_IDX => 0,
+	YIT_NODE_INFO_BY_NODE_ID   => 1,
+	YIT_NODE_INFO_BY_NODE_SN   => 2,
+        YIT_NODE_INFO_ALL_NODES    => 3,
+};
+
+use constant {
+	YIT_DATA_SERV_INTRA_BROADCAST  => 0,
+	YIT_DATA_SERV_INTRA_UNICAST    => 1,
+	YIT_DATA_SERV_INTRA_UNICAST_SN => 2,
+	YIT_DATA_SERV_INTER_BROADCAST  => 3,
+	YIT_DATA_SERV_INTER_UNICAST    => 4,
+};
+
+use constant {
+	YIT_TX_GAIN_0 => 0,
+	YIT_TX_GAIN_1 => 1,
+        YIT_TX_GAIN_2 => 2,
+        YIT_TX_GAIN_3 => 3,
+        YIT_TX_GAIN_4 => 4,
+        YIT_TX_GAIN_5 => 5,
+	YIT_TX_GAIN_6 => 6,
+        YIT_TX_GAIN_7 => 7,
+};
+
+use constant {
+	YIT_TX_ENCRYPTED_0 => 0,
+	YIT_TX_ENCRYPTED_1 => 1,
+};
+
+use constant {
+	YIT_PKT_PRIO_NORMAL    => 0,
+	YIT_PKT_PRIO_HIGH      => 1,
+	YIT_PKT_PRIO_EMERGENCY => 2,
+};
+
+use constant {
+	YIT_PKT_SERV_NO_ACK  => 0,
+	YIT_PKT_SERV_ACK_REQ => 1,
+};
+
+use constant {
+	YIT_COMMAND_FAILED  => 0x00,
+	YIT_COMMAND_SUCCESS => 0x01,
+};
+
+use constant {
+	YIT_RST_NO_EEPROM            => 6,
+	YIT_RST_SUCCESS              => 7,
+	YIT_RST_FACTORY_DEFULT       => 8,
+	YIT_RST_DLL_FATAL_ERROR      => 32,
+	YIT_RST_DLL_AUTO_ONLINE_MODE => 64,
+	YIT_RST_DLL_SAFE_MODE        => 66,
+};
+
+my %yit_rst_state_txt = (
+	6  => 'NO EEPROM',
+	7  => 'SUCCESS',
+	8  => 'FACTORY_DEFULT',
+	32 => 'DLL_FATAL_ERROR',
+	64 => 'DLL_AUTO_ONLINE_MODE',
+	66 => 'DLL_SAFE_MODE',
+);
+
+use constant {
+	YIT_SERIAL_NUM_TABLE         => 0x05,
+	YIT_CONF_PARAM_TABLE         => 0x06,
+	YIT_FACT_DEFAULT_TABLE       => 0x08,
+	YIT_FACT_DEFAULT_VALID_TABLE => 0x09,
+	YIT_DEBUG_COUNTERS_TABLE     => 0x0B,
+	YIT_ALL_TABLES               => 0xFF,
+};
+
+use constant {
+	YIT_ADMIT_RS  => 0x0000,
+	YIT_REFUSE_RS => 0x2000,
+};
+
+use constant {
+	YIT_TX_PKT_ADMIS => 1,
+	YIT_TX_PKT_TRANS => 3,
+};
+
+my %yit_tx_pkt_type = (
+	1 => 'ADMIS',
+	3 => 'TRANS',
+);
+
+use constant {
+	YIT_ADM_RESULT_ACCEPTED                => 0,
+	YIT_ADM_RESULT_REJECTED_NO_MEMORY      => 1,
+	YIT_ADM_RESULT_REJECTED_FATAL_ERROR    => 2,
+	YIT_ADM_RESULT_REJECTED_NODE_NOT_FOUND => 3,
+};
+
+my %yit_adm_res_txt = (
+	0 => 'ACCEPTED',
+	1 => 'REJECTED NO MEMORY',
+	2 => 'REJECTED FATAL ERROR',
+	3 => 'REJECTED NODE NOT FOUND',
+);
+
+use constant {
+	YIT_TRANS_RESULT_TRANSMITTED          => 0,
+	YIT_TRANS_RESULT_N_A                  => 1,
+	YIT_TRANS_RESULT_NO_ACKNOWLEDGE       => 2,
+	YIT_TRANS_RESULT_NO_TARGET_RESOURCES  => 3,
+	YIT_TRANS_RESULT_BLOCKED              => 4,
+	YIT_TRANS_RESULT_UNKNOWN_ERROR        => 5,
+};
+
+my %yit_trs_res_txt = (
+	0 => 'TRANSMITTED',
+	1 => 'N/A',
+	2 => 'NO ACKNOWLEDGE',
+	3 => 'NO TARGET RESOURCES',
+	4 => 'BLOCKED',
+	5 => 'UNKNOWN_ERROR',
+);
+
+use constant {
+	GET_NODE_NFO_CON_STAT_POS => 23,
+};
+
+use constant {
+	YIT_RS_DISCONNECTED => 0,
+	YIT_RS_GOOD_CONNECT => 1,
+	YIT_RS_POOR_CONNECT => 2,
+};
+
+my %yit_rs_con_stat = (
+	0 => 'Disconnected',
+	1 => 'Connection ok',
+	2 => 'Connection poor',
+);
+
+use constant {
+	YIT_NODE_LETF_NET_NO_REASON        => 0,
+	YIT_NODE_LETF_NET_TO_OTHER_NETWORK => 1,
+	YIT_NODE_LETF_NET_NO_PARENT        => 2,
+	YIT_NODE_LETF_NET_APP_REQUEST      => 3,
+};
+
+my %yit_node_left_net = (
+	0 => 'NO_REASON',
+	1 => 'TO_OTHER_NETWORK',
+	2 => 'NO_PARENT',
+	3 => 'APP_REQUEST',
+);
+
+my @nc_module_config = (
+	{key => 'uart_rate',                  v => 3840},
+	{key => 'modulation',                 v => 0},
+	{key => 'operation_mode',             v => 3},
+	{key => 'network_size',               v => 10},
+	{key => 'nc_database_size',           v => 10},
+	{key => 'num_of_sn_bytes_in_addr_db', v => 16},
+	{key => 'nc_admission_mode',          v => 3},
+	{key => 'max_network_depth',          v => 8},
+	{key => 'auto_configuration',         v => 0},
+	{key => 'src_node_addr_type',         v => 1},
+	{key => 'rx_filter_m',                v => 1},
+	{key => 'rx_filter_d',                v => 0},
+	{key => 'rx_filter_n',                v => 0},
+	{key => 'rx_filter_i',                v => 0},
+	{key => 'rx_filter_c',                v => 0},
+	{key => 'rx_filter_mr',               v => 0},
+	{key => 'rx_filter_or',               v => 0},
+	{key => 'nl_mng_enabled',             v => 1},
+	{key => 'warm_start_enabled',         v => 1},
+	{key => 'parent_mode_enabled',        v => 1},
+	{key => 'network_id_select_mode',     v => 0},
+);
+
+my @module_config = (
+	{idx => 0x0005, key => 'uart_rate', txt => 'UART Rate', rom => 3840, act => undef()},
+	{idx => 0x0018, key => 'network_id',txt => 'Network ID', rom => 0, act => undef()},
+	{idx => 0x0019, key => 'node_id', txt => 'Node ID', rom => 1, act => undef()},
+	{idx => 0x001A, key => 'modulation', txt => 'Modulation', rom => 0, act => undef()},
+	{idx => 0x001C, key => 'un_ack_repeats', txt => 'UN ACK Repeats', rom => 0, act => undef()},
+	{idx => 0x001D, key => 'ack_retries', txt => 'ACK Retries', rom => 4, act => undef()},
+	{idx => 0x0020, key => 'parent_address', txt => 'Parent address', rom => 0, act => undef()},
+	{idx => 0x0021, key => 'nc_address', txt => 'NC address', rom => 0, act => undef()},
+	{idx => 0x0022, key => 'distance_from_nc', txt => 'Distance from NC', rom => 255, act => undef()},
+	{idx => 0x002E, key => 'forced_network_id', txt => 'Forced Network ID', rom => 0, act => undef()},
+	{idx => 0x0031, key => 'operation_mode', txt => 'Operation Mode', rom => 0, act => undef()},
+	{idx => 0x0038, key => 'network_size', txt => 'Network size', rom => 10, act => undef()},
+	{idx => 0x005B, key => 'nc_database_size', txt => 'NC Database Size', rom => 10, act => undef()},
+	{idx => 0x003A, key => 'num_of_sn_bytes_in_addr_db', txt => 'Number of S/N bytes in Address database', rom => 4, act => undef()},
+	{idx => 0x003B, key => 'num_of_sn_msb_to_cmp', txt => 'Number Of S/N msb to Compare', rom => 8, act => undef()},
+	{idx => 0x003C, key => 'nc_admission_mode', txt => 'NC Admission Mode', rom => 0, act => undef()},
+	{idx => 0x004E, key => 'node_key0', txt => 'Node Key 0', rom => 0, act => undef()},
+	{idx => 0x004F, key => 'node_key1', txt => 'Node Key 1', rom => 0, act => undef()},
+	{idx => 0x0050, key => 'node_key2', txt => 'Node Key 2', rom => 0, act => undef()},
+	{idx => 0x0051, key => 'node_key3', txt => 'Node Key 3', rom => 0, act => undef()},
+	{idx => 0x0052, key => 'node_key4', txt => 'Node Key 4', rom => 0, act => undef()},
+	{idx => 0x0053, key => 'node_key5', txt => 'Node Key 5', rom => 0, act => undef()},
+	{idx => 0x0054, key => 'node_key6', txt => 'Node Key 6', rom => 0, act => undef()},
+	{idx => 0x0055, key => 'node_key7', txt => 'Node Key 7', rom => 0, act => undef()},
+	{idx => 0x005F, key => 'operation_band', txt => 'Operation Band', rom => 0, act => undef()},
+	{idx => 0x0072, key => 'max_network_depth', txt => 'Max Network Depth', rom => 8, act => undef()},
+	{idx => 0x0100, key => 'auto_configuration', txt => 'Auto configuration', rom => 0, act => undef()},
+	{idx => 0x0103, key => 'send_v1_packets', txt => 'Send V1 Packets', rom => 0, act => undef()},
+	{idx => 0x0104, key => 'src_node_addr_type', txt => 'Source node address type at receiver host', rom => 0, act => undef()},
+	{idx => 0x0107, key => 'rx_filter_m', txt => 'Rx Filter M', rom => 1, act => undef()},
+	{idx => 0x0108, key => 'rx_filter_d', txt => 'Rx Filter D', rom => 0, act => undef()},
+	{idx => 0x0109, key => 'rx_filter_n', txt => 'Rx Filter N', rom => 0, act => undef()},
+	{idx => 0x010A, key => 'rx_filter_i', txt => 'Rx Filter I', rom => 0, act => undef()},
+	{idx => 0x010B, key => 'rx_filter_c', txt => 'Rx Filter C', rom => 0, act => undef()},
+	{idx => 0x010D, key => 'rx_filter_mr', txt => 'Rx Filter MR', rom => 0, act => undef()},
+	{idx => 0x010E, key => 'rx_filter_or', txt => 'Rx Filter OR', rom => 0, act => undef()},
+	{idx => 0x0200, key => 'nl_mng_enabled', txt => 'NL Mng Enabled', rom => 1, act => undef()},
+	{idx => 0x0202, key => 'warm_start_enabled', txt => 'Warm Start Enabled', rom => 1, act => undef()},
+	{idx => 0x0203, key => 'parent_mode_enabled', txt => 'Parent mode enabled', rom => 1, act => undef()},
+	{idx => 0x0206, key => 'network_id_select_mode', txt => 'Network ID selection mode', rom => 0, act => undef()},
+	{idx => 0x020D, key => 'remote_config_enable', txt => 'Remote Configuration Enable', rom => 1, act => undef()},
+	{idx => 0x020E, key => 'remote_ver_down_enable', txt => 'Remote Version Download Enable', rom => 1, act => undef()},
+	{idx => 0x005D, key => 'distrib_param_index', txt => 'Distributed parameter index', rom => 255, act => undef()},
+	{idx => 0x005E, key => 'distrib_param_value', txt => 'Distributed parameter value', rom => 10, act => undef()}
+);
+
+sub TCFLSH() {
+	TCFLSH_constant();
+}
+
+sub LOG_INFO() {
+	LOG_INFO_constant();
+}
+
+sub LOG_ERR() {
+	LOG_ERR_constant();
+}
+
+$SIG{HUP} = 'IGNORE';
+$SIG{INT} = 'IGNORE';
+$SIG{USR1} = 'IGNORE';
+$SIG{TERM} = 'IGNORE';
+
+my $sig_hup;
+my $sig_int;
+my $sig_usr1;
+my $sig_term;
+
+my $mycfg_key_rex = qr![[:alpha:]][[:alnum:]]*(?:[-._][[:alnum:]]+)*!;
+my $mycfg_val_rex = qr!(")[-|./ \w'",:]*\g{-1}|[-|./\w,*:]+!;
+my $sn_rex = qr![0-9a-fA-F]{32}!;
+my $hex_str_rex = qr!(?:[0-9a-fA-F][0-9a-fA-F])+!;
+
+my $I = 'yitctld';
+my $VERSION = "$I v1.04";
+my %mycfg;
+my @mycfg_keys;
+my $daemon = TRUE;
+my $proc_type = PARENT_PROCESS;
+my $dbg = 0;
+my $pid_file = "/run/$I/pid";
+my $pid_fh;
+my $socket;
+my $sock_type;
+my $s_sock;
+my $c_sock;
+my @cmd_tokens;
+my $cmd_pending = FALSE;
+my $port;
+my %module;
+my @send_data;
+my @recv_mesg;
+my $mesg_recv_state;
+my $stm;
+my %rsdb;
+my @bcdata;
+my $tx_pkt_tag;
+my $clear_ndbase = FALSE;
+my $bcast_period_s_tmo = BCAST_PERIOD_S_TMO;
+my $txp_delay_s_tmo = TXP_DELAY_S_TMO;
+my $offline = FALSE;
+my @node_nfo_fifo;
+my @unicast_fifo;
+my $reset_ucast_sched;
+my $init_ok = FALSE;
+my $term_out = FALSE;
+
+my $mycfg_keys_def = <<'MYCFG_KEYS_DEF';
+	control_socket		    # control_socket = loopback:8810
+	serial_port_file            # serial_port_file = /dev/ttyS3
+	serial_port_speed           # serial_port_speed = 38400
+	broadcast_period            # broadcast_period = 120
+	start_unicasts_delay        # start_unicasts_delay = 2700
+	next_unicasts_delay         # next_unicasts_delay = 180
+	default_broadcast_data      # default_broadcast_data = 00
+	default_unicast_data        # default_unicast_data = 00
+	node_data_queue_size        # node_data_queue_size = 20
+	send_mesg_renice	    # send_mesg_renice = 15
+	transmit_gain               # transmit_gain = 5
+	data_integrity		    # data_integrity = 0
+	operation_band              # operation_band = CA3
+	yi_network_size             # yi_network_size = 10
+	yi_max_network_depth        # yi_max_network_depth = 8
+	yi_nc_database_size         # yi_nc_database_size = 10
+	yi_uart_rate		    # yi_uart_rate = 3840
+MYCFG_KEYS_DEF
+
+@mycfg_keys = $mycfg_keys_def =~ /^\s*($mycfg_key_rex)\s*#\s*\g{-1}.*$/mg;
+
+my %yit_stats = (
+	rst_try_cnt       => 0,
+	rst_cnt 	  => 0,
+	bcast_txp_cnt     => 0,
+	ucast_txp_cnt     => 0,
+	adm_tag_err_cnt   => 0,
+	trn_tag_err_cnt   => 0,
+	txp_adm_err_cnt   => 0,
+	txp_adm_tmo_cnt   => 0,
+	txp_trn_err_cnt   => 0,
+	txp_trn_tmo_cnt   => 0,
+	rxp_inter_cnt     => 0,
+	rxp_bcast_cnt     => 0,
+	rxp_bad_sn_cnt    => 0,
+	rxp_ord_err_cnt   => 0,
+	rxp_tag_err_cnt   => 0,
+	rxp_crc_err_cnt   => 0,
+);
+
+my %mesg_stats = (
+	send_mesg_cnt  => 0,
+	recv_mesg_cnt  => 0,
+	sum_error_cnt  => 0,
+	sync_error_cnt => 0,
+	size_error_cnt => 0,
+);
+
+my %stm_states = (
+	stm_rst_mod        => {func => \&stm_rst_mod, m => 'IT700 reset'},
+	stm_mod_nfo        => {func => \&stm_mod_nfo, m => 'IT700 info'},
+	stm_rd_cf_par      => {func => \&stm_rd_cf_par, m => 'Read IT700 parameters'},
+	stm_set_op_band    => {func => \&stm_set_op_band, m => 'Set IT700 operation band'},
+	stm_upd_cf_par     => {func => \&stm_upd_cf_par, m => 'Update IT700 parameters'},
+	stm_save_cf_par    => {func => \&stm_save_cf_par, m => 'Save IT700 parameters'},
+	stm_clr_ndbase     => {func => \&stm_clr_ndbase, m => 'Clear IT700 node database'},
+	stm_get_netid      => {func => \&stm_get_netid, m => 'Wait Network ID'},
+	stm_read_ndbase    => {func => \&stm_read_ndbase, m => 'Read IT700 node database'},
+	stm_upd_ndbase     => {func => \&stm_upd_ndbase, m => 'Update IT700 node database'},
+	stm_node_nfo       => {func => \&stm_node_nfo, m => 'Read node info'},
+	stm_offline        => {func => \&stm_offline, m => 'Network offline'},
+	stm_scheduler      => {func => \&stm_scheduler, m => 'Scheduler'},
+	stm_txpacket       => {func => \&stm_txpacket, m => 'TX Packet'},
+	stm_admission      => {func => \&stm_admission, m => 'Admission'},
+);
+
+use constant {
+	STM_RST_MOD__INIT       => 0,
+	STM_RST_MOD__RST        => 1,
+	STM_RST_MOD__RST_WA_RPL => 2,
+	STM_RST_MOD__WA_BEF_RST => 3,
+};
+
+use constant {
+	STM_MOD_NFO__READ_SN         => 0,
+	STM_MOD_NFO__READ_SN_WA_RPL  => 1,
+	STM_MOD_NFO__READ_FWV        => 2,
+	STM_MOD_NFO__READ_FWV_WA_RPL => 3,
+};
+
+use constant {
+	STM_RD_CF_PAR__INIT               => 0,
+	STM_RD_CF_PAR__GET_DEV_PAR        => 1,
+	STM_RD_CF_PAR__GET_DEV_PAR_WA_RPL => 2,
+};
+
+use constant {
+	STM_SET_OP_BAND__SET_PRED_PAR        => 0,
+	STM_SET_OP_BAND__SET_PRED_PAR_WA_RPL => 1,
+};
+
+use constant {
+	STM_UPD_CF_PAR__INIT               => 0,
+	STM_UPD_CF_PAR__SET_DEV_PAR        => 1,
+	STM_UPD_CF_PAR__SET_DEV_PAR_WA_RPL => 2,
+};
+
+use constant {
+	STM_SAVE_CF_PAR__SAVE_DEV_PAR        => 0,
+	STM_SAVE_CF_PAR__SAVE_DEV_PAR_WA_RPL => 1,
+};
+
+use constant {
+	STM_CLR_NDBASE__DEL_NFO        => 0,
+	STM_CLR_NDBASE__DEL_NFO_WA_RPL => 1,
+};
+
+use constant {
+	STM_GET_NETID__GO_ONLINE        => 0,
+	STM_GET_NETID__GO_ONLINE_WA_RPL => 1,
+	STM_GET_NETID__NETID_WA_IND     => 2,
+};
+
+use constant {
+	STM_READ_NDBASE__GET_SZ         => 0,
+	STM_READ_NDBASE__GET_SZ_WA_RPL  => 1,
+	STM_READ_NDBASE__GET_NFO        => 2,
+	STM_READ_NDBASE__GET_NFO_WA_RPL => 3,
+};
+
+use constant {
+	STM_UPD_NDBASE__DEL_NFO        => 0,
+	STM_UPD_NDBASE__DEL_NFO_WA_RPL => 1,
+};
+
+use constant {
+	STM_NODE_NFO__GET_NFO        => 0,
+	STM_NODE_NFO__GET_NFO_WA_RPL => 1,
+};
+
+use constant {
+	STM_TXPACKET__TXP        => 0,
+	STM_TXPACKET__WA_ADM_RPL => 1,
+	STM_TXPACKET__WA_TRN_RPL => 2,
+};
+
+use constant {
+	STM_ADMISSION__ADM_APPR        => 0,
+	STM_ADMISSION__ADM_APPR_WA_RPL => 1,
+};
+
+use constant {
+	UCAST_SCHED__INIT_LIST => 0,
+	UCAST_SCHED__WA_RS_RPL => 1,
+	UCAST_SCHED__WA_IDLE   => 2,
+};
+
+$mesg_recv_state = MESG_WAIT_FLAG;
+$stm_states{stm_txpacket}->{bcast_count} = 0;
+$stm = 'stm_rst_mod';
+$stm_states{$stm}->{job} = STM_RST_MOD__RST;
+
+setproctitle($I);
+
+$ENV{PATH} = '';
+umask(0);
+select((select(STDERR), $| = 1)[0]);
+$| = 1;
+
+parse_options();
+
+if ($< != 0) {
+	syslog(LOG_ERR, "$I must be executed under UID0.");
+	error_exit();
+}
+
+parse_mycfg();
+
+parse_rscfg();
+
+$pid_fh = IO::File->new();
+unless ($pid_fh->open($pid_file, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR)) {
+	syslog(LOG_ERR, qq^Can't open file "$pid_file". System error: $!.^);
+	undef($pid_fh);
+	error_exit();
+}
+unless (flock($pid_fh, LOCK_EX | LOCK_NB)) {
+	syslog(LOG_ERR, qq^Can't lock file "$pid_file", $I already started?^);
+	error_exit();
+}
+unless ($pid_fh->truncate(0)) {
+	syslog(LOG_ERR, qq^Can't truncate file "$pid_file". System error: $!.^);
+	error_exit();
+}
+$pid_fh->autoflush();
+
+open_serial_port();
+
+create_s_socket();
+
+if ($daemon) {
+	my $sig;
+	$SIG{USR1} = sub {$sig = 'USR1'};
+	$SIG{TERM} = sub {$sig = 'TERM'};
+	do_fork();
+	if ($proc_type == PARENT_PROCESS) {
+		while (TRUE) {
+			sleep(1);
+			if ($sig eq 'TERM') {
+				exit(0);
+			} elsif ($sig eq 'USR1') {
+				syslog(LOG_ERR, 'Daemon initialization error.');
+				error_exit();
+			}
+		}
+	}
+}
+
+$SIG{HUP} = sub {$sig_hup++};
+$SIG{INT} = sub {$sig_int++};
+$SIG{USR1} = sub {$sig_usr1++};
+$SIG{TERM} = sub {$sig_term++};
+
+if ($proc_type == PARENT_PROCESS) {
+	unless ($pid_fh->write("$$\n")) {
+		syslog(LOG_ERR, qq^Can't write to file "$pid_file". System error: $!.^);
+		error_exit();
+	}
+}
+
+syslog(LOG_INFO, "Initialization done, @{[$proc_type == PARENT_PROCESS ? 'terminal' : 'daemon']} mode.");
+$init_ok = TRUE;
+
+while (TRUE) {
+	my ($bits, $nfd) = '';
+	state $tml = 0;
+	check_signals();
+	unless (defined($c_sock)) {
+		if (accept($c_sock, $s_sock)) {
+			my $fl;
+			unless ($fl = fcntl($c_sock, F_GETFL, 0)) {
+				syslog(LOG_ERR, qq^Fcntl F_GETFL failed on client socket "$socket". System error: $!.^);
+				error_exit();
+			}
+			unless (fcntl($c_sock, F_SETFL, $fl | O_NONBLOCK)) {
+				syslog(LOG_ERR, qq^Fcntl F_SETFL failed on client socket "$socket". System error: $!.^);
+				error_exit();
+			}
+			unless (close($s_sock)) {
+				undef($s_sock);
+				syslog(LOG_ERR, qq^Can't close server socket "$socket". System error: $!.^);
+				error_exit();
+			} else {
+				undef($s_sock);
+				syslog(LOG_INFO, qq^Client connected to socket "$socket".^);
+			}
+		} else {
+			undef($c_sock);
+			if ($! != EAGAIN) {
+				syslog(LOG_ERR, qq^Accept fail on server socket "$socket". System error: $!.^);
+				error_exit();
+			}
+		}
+	}
+	vec($bits, fileno($port), 1) = 1;
+	vec($bits, fileno($c_sock), 1) = 1 if (defined($c_sock) && !$cmd_pending);
+	if (($nfd = select($bits, undef(), undef(), MAIN_LOOP_SELECT_S_TMO)) == -1) {
+		if ($! != EINTR) {
+			syslog(LOG_ERR, "Select failed. System error: $!.");
+			error_exit();
+		}
+		next;
+	} elsif ($nfd == 0) {
+		$tml = clock_gettime(CLOCK_MONOTONIC);
+		$stm_states{$stm}->{func}->(TIME_PASS_EVENT, $tml);
+		cmd_handler() if ($cmd_pending);
+		next;
+	}
+	if (vec($bits, fileno($port), 1)) {
+		read_serial_port();
+	} elsif (vec($bits, fileno($c_sock), 1)) {
+		read_c_socket();
+	} else {
+		syslog(LOG_ERR, 'Select failed. Bits array error.');
+		error_exit();
+	}
+	if ((my $tma = clock_gettime(CLOCK_MONOTONIC)) > $tml + MAIN_LOOP_SELECT_S_TMO) {
+		$stm_states{$stm}->{func}->(TIME_PASS_EVENT, $tma);
+		cmd_handler() if ($cmd_pending);
+		$tml = $tma;
+	}
+}
+
+sub read_serial_port {
+	my ($buf, $cnt);
+	state ($sum, $sz);
+	state @msg;
+
+	unless (defined($cnt = $port->sysread($buf, 1))) {
+		syslog(LOG_ERR, qq^Read from file "$mycfg{serial_port_file}" failed. System error: $!.^);
+		error_exit();
+	}
+	if ($cnt == 0) {
+		syslog(LOG_ERR, qq^Read 0 bytes from "$mycfg{serial_port_file}".^);
+		error_exit();
+	}
+	my $bt = unpack('C', $buf);
+	if ($mesg_recv_state == MESG_WAIT_FLAG) {
+		if ($bt == MESG_FLAG) {
+			$mesg_recv_state = MESG_WAIT_SZ_LSB;
+		} else {
+			$mesg_stats{sync_error_cnt}++;
+		}
+	} elsif ($mesg_recv_state == MESG_WAIT_SZ_LSB) {
+		$sz = $sum = $bt;
+		$mesg_recv_state = MESG_WAIT_SZ_MSB;
+	} elsif ($mesg_recv_state == MESG_WAIT_SZ_MSB) {
+		$sum += $bt;
+		$sz |= $bt << 8;
+		if ($sz < MIN_MESG_SIZE || $sz > MAX_MESG_SIZE) {
+			$mesg_stats{size_error_cnt}++;
+			$mesg_recv_state = MESG_WAIT_FLAG;
+		} else {
+			@msg = ();
+			$mesg_recv_state = MESG_RCV_DATA;
+		}
+	} elsif ($mesg_recv_state == MESG_RCV_DATA) {
+		$sum += $bt;
+		push(@msg, $bt);
+		if (!--$sz) {
+			$mesg_recv_state = MESG_RCV_SUM;
+		}
+	} elsif ($mesg_recv_state == MESG_RCV_SUM) {
+		if ($bt == ($sum & 0xFF)) {
+			log_mesg(\@msg, MESG_DIR_RECV) if ($dbg > 1);
+			$mesg_stats{recv_mesg_cnt}++;
+			@recv_mesg = @msg;
+			$stm_states{$stm}->{func}->(RECV_MESG_EVENT, clock_gettime(CLOCK_MONOTONIC));
+		} else {
+			$mesg_stats{sum_error_cnt}++;
+			syslog(LOG_INFO, 'Serial message sum error.');
+		}
+		$mesg_recv_state = MESG_WAIT_FLAG;
+	}
+}
+
+sub read_c_socket {
+	state $row = '';
+	my ($buf, $rn);
+
+	if (defined($rn = sysread($c_sock, $buf, SOCKET_READ_BYTES))) {
+		if ($rn) {
+			if (($row .= $buf) eq "\n") {
+				$row = '';
+				return;
+			}
+			if (index($row, "\n", length($row) - 1) != -1) {
+				chomp($row);
+				@cmd_tokens = split(/\s+/, $row);
+				if (scalar(@cmd_tokens)) {
+					cmd_handler();
+				}
+				$row = '';
+			}
+		} else {
+			unless (close($c_sock)) {
+				undef($c_sock);
+				syslog(LOG_ERR, qq^Can't close client socket "$socket". System error: $!.^);
+				error_exit();
+			}
+			syslog(LOG_INFO, qq^Client disconnected from socket "$socket".^);
+			undef($c_sock);
+			create_s_socket();
+			$row = '';
+		}
+	} else {
+		syslog(LOG_ERR, qq^Can't read on client socket "$socket". System error: $!.^);
+		error_exit();
+	}
+}
+
+sub send_mesg {
+	my ($sum, $msg, $m_sz, $s_sz, $pri) = 0;
+
+	$msg = pack('C', $send_data[0]);
+	for (my $i = 1; $i < scalar(@send_data); $i++) {
+		$sum += $send_data[$i];
+		$msg .= pack('C', $send_data[$i]);
+	}
+	$msg .= pack('C', $sum & 0xFF);
+	$m_sz = length($msg);
+	if ($mycfg{send_mesg_renice}) {
+		$pri = getpriority(0, 0);
+		set_priority(-$mycfg{send_mesg_renice});
+	}
+	unless (defined($s_sz = $port->syswrite($msg, $m_sz))) {
+		syslog(LOG_ERR, qq^Can't write to file "$mycfg{serial_port_file}". System error: $!.^);
+		error_exit();
+	}
+	if ($mycfg{send_mesg_renice}) {
+		set_priority($pri);
+	}
+	if ($s_sz != $m_sz) {
+		syslog(LOG_ERR, qq^Write to file "$mycfg{serial_port_file}" failed, syswrite() error.^);
+		error_exit();
+	}
+	$mesg_stats{send_mesg_cnt}++;
+	log_mesg(\@send_data, MESG_DIR_SEND) if ($dbg > 1);
+}
+
+sub init_state_data {
+	undef_admission_request();
+	$stm_states{stm_scheduler}->{in} = FALSE;
+	$stm_states{stm_scheduler}->{last_txp_tms} = 0;
+	$reset_ucast_sched = TRUE;
+}
+
+sub stm_rst_mod {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state $tmo;
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_RST_MOD__INIT) {
+			$tmo = $tms + INIT_RST_WAIT_S_TMO;
+			$stm_states{$stm}->{job} = STM_RST_MOD__WA_BEF_RST;
+		} elsif ($stm_states{$stm}->{job} == STM_RST_MOD__RST) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			init_state_data();
+			$yit_stats{rst_try_cnt}++;
+			flush_port_recv_buf();
+			$mesg_recv_state = MESG_WAIT_FLAG;
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x02;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_RESET;
+			send_mesg();
+			$tmo = $tms + RST_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_RST_MOD__RST_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_RST_MOD__RST_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m timeout.");
+				goto error;
+			}
+		} elsif ($stm_states{$stm}->{job} == STM_RST_MOD__WA_BEF_RST) {
+			if ($tms > $tmo) {
+				$stm_states{$stm}->{job} = STM_RST_MOD__RST;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_RST_MOD__RST_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE || $recv_mesg[1] != YIT_RESET) {
+				syslog(LOG_INFO, "$m error.");
+				goto error;
+			}
+			if ($recv_mesg[2] == YIT_RST_NO_EEPROM || $recv_mesg[2] == YIT_RST_DLL_FATAL_ERROR) {
+				syslog(LOG_INFO, "$m. @{[field_nfo($recv_mesg[2], \%yit_rst_state_txt)]}.");
+				goto error;
+			}
+			$yit_stats{rst_cnt}++;
+			syslog(LOG_INFO, "$m. @{[field_nfo($recv_mesg[2], \%yit_rst_state_txt)]}.");
+			unless (exists($module{sn})) {
+				$stm = 'stm_mod_nfo';
+				$stm_states{$stm}->{job} = STM_MOD_NFO__READ_SN;
+			} else {
+				$stm = 'stm_rd_cf_par';
+				$stm_states{$stm}->{job} = STM_RD_CF_PAR__INIT;
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$tmo = $tms + NEXT_RST_WAIT_S_TMO;
+	$stm_states{$stm}->{job} = STM_RST_MOD__WA_BEF_RST;
+}
+
+sub stm_mod_nfo {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state $tmo;
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_MOD_NFO__READ_SN) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x07;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_GET_DEVICE_PARAMETERS;
+			$send_data[5] = YIT_SERIAL_NUM_TABLE;
+			w16_le(\@send_data, 6, 0xBAAB);
+			w16_le(\@send_data, 8, 0);
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_MOD_NFO__READ_SN_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_MOD_NFO__READ_SN_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. GET_DEVICE_PARAMETERS timeout.");
+				goto error;
+			}
+		} elsif ($stm_states{$stm}->{job} == STM_MOD_NFO__READ_FWV) {
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x02;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_GET_VERSION;
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_MOD_NFO__READ_FWV_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_MOD_NFO__READ_FWV_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. GET_VERSION timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_MOD_NFO__READ_SN_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+                            $recv_mesg[1] != YIT_GET_DEVICE_PARAMETERS ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. GET_DEVICE_PARAMETERS error.");
+				goto error;
+			}
+			@{$module{sn}} = @recv_mesg[3 .. $#recv_mesg];
+			syslog(LOG_INFO, "sn: @{[sn_ary_to_hex_str($module{sn})]}.");
+			$stm_states{$stm}->{job} = STM_MOD_NFO__READ_FWV;
+		} elsif ($stm_states{$stm}->{job} == STM_MOD_NFO__READ_FWV_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+			    $recv_mesg[1] != YIT_GET_VERSION ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. GET_VERSION error.");
+				goto error;
+			}
+			$module{fwv}->{maj} = $recv_mesg[3];
+			$module{fwv}->{min} = $recv_mesg[4];
+			$module{fwv}->{bld} = $recv_mesg[5];
+			my $fwv = "$module{fwv}->{maj}.$module{fwv}->{min}.$module{fwv}->{bld}";
+			if (chr($module{fwv}->{maj}) . chr($module{fwv}->{min}) . chr($module{fwv}->{bld}) lt v5.2.22) {
+				syslog(LOG_ERR, "Detected IT700 with unsupported firmware version $fwv.");
+				error_exit();
+			} else {
+				syslog(LOG_INFO, "fwv: $fwv.");
+			}
+			$stm = 'stm_rd_cf_par';
+			$stm_states{$stm}->{job} = STM_RD_CF_PAR__INIT;
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_rd_cf_par {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state ($tmo, $pos);
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_RD_CF_PAR__INIT) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			$pos = 0;
+			$stm_states{$stm}->{job} = STM_RD_CF_PAR__GET_DEV_PAR;
+		} elsif ($stm_states{$stm}->{job} == STM_RD_CF_PAR__GET_DEV_PAR) {
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x07;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_GET_DEVICE_PARAMETERS;
+			$send_data[5] = YIT_CONF_PARAM_TABLE;
+			w16_le(\@send_data, 6, ${$module_config[$pos]}{idx});
+			w16_le(\@send_data, 8, 1);
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_RD_CF_PAR__GET_DEV_PAR_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_RD_CF_PAR__GET_DEV_PAR_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. GET_DEVICE_PARAMETERS timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_RD_CF_PAR__GET_DEV_PAR_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+                            $recv_mesg[1] != YIT_GET_DEVICE_PARAMETERS ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. GET_DEVICE_PARAMETERS error.");
+				goto error;
+			}
+			${$module_config[$pos]}{act} = le_w16(\@recv_mesg, 3);
+			if (++$pos < @module_config) {
+				$stm_states{$stm}->{job} = STM_RD_CF_PAR__GET_DEV_PAR;
+			} else {
+				syslog(LOG_INFO, "$m ok.") if ($dbg);
+				if (${$module_config[get_idx_by_key(\@module_config, 'operation_band')]}{act} != $module{op_band}) {
+					$stm = 'stm_set_op_band';
+					$stm_states{$stm}->{job} = STM_SET_OP_BAND__SET_PRED_PAR;
+				} else {
+					$stm = 'stm_upd_cf_par';
+					$stm_states{$stm}->{job} = STM_UPD_CF_PAR__INIT;
+				}
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_set_op_band {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state $tmo;
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_SET_OP_BAND__SET_PRED_PAR) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x04;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_SET_PREDEFINED_PARAMETERS;
+			$send_data[5] = YIT_ALL_TABLES;
+			$send_data[6] = $module{region};
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_SET_OP_BAND__SET_PRED_PAR_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_SET_OP_BAND__SET_PRED_PAR_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. SET_PREDEFINED_PARAMETERS timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_SET_OP_BAND__SET_PRED_PAR_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+                            $recv_mesg[1] != YIT_SET_PREDEFINED_PARAMETERS ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. SET_PREDEFINED_PARAMETERS error.");
+				goto error;
+			}
+			$clear_ndbase = TRUE;
+			syslog(LOG_INFO, "$m ok.");
+			$stm = 'stm_save_cf_par';
+			$stm_states{$stm}->{job} = STM_SAVE_CF_PAR__SAVE_DEV_PAR;
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_upd_cf_par {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state ($tmo, $pos, $wri);
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_UPD_CF_PAR__INIT) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			$pos = 0;
+			$wri = 0;
+			$stm_states{$stm}->{job} = STM_UPD_CF_PAR__SET_DEV_PAR;
+		} elsif ($stm_states{$stm}->{job} == STM_UPD_CF_PAR__SET_DEV_PAR) {
+			my $par_idx;
+			for (; $pos < @nc_module_config; $pos++) {
+				my $mci = get_idx_by_key(\@module_config, ${$nc_module_config[$pos]}{key});
+				if (${$nc_module_config[$pos]}{v} != ${$module_config[$mci]}{act}) {
+					$par_idx = ${$module_config[$mci]}{idx};
+					last;
+				}
+			}
+			if ($pos == @nc_module_config) {
+				syslog(LOG_INFO, "$m ok.") if $dbg;
+				if ($wri) {
+					$stm = 'stm_save_cf_par';
+					$stm_states{$stm}->{job} = STM_SAVE_CF_PAR__SAVE_DEV_PAR;
+				} else {
+					if ($clear_ndbase) {
+						$stm = 'stm_clr_ndbase';
+						$stm_states{$stm}->{job} = STM_CLR_NDBASE__DEL_NFO;
+					} else {
+						if ($offline) {
+							$stm = 'stm_offline';
+							syslog(LOG_INFO, 'Network offline.');
+						} else {
+							$stm = 'stm_get_netid';
+							$stm_states{$stm}->{job} = STM_GET_NETID__GO_ONLINE;
+						}
+					}
+				}
+				return;
+			}
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x07;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_SET_DEVICE_PARAMETERS;
+			$send_data[5] = YIT_CONF_PARAM_TABLE;
+			w16_le(\@send_data, 6, $par_idx);
+			w16_le(\@send_data, 8, ${$nc_module_config[$pos]}{v});
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_UPD_CF_PAR__SET_DEV_PAR_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_UPD_CF_PAR__SET_DEV_PAR_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. SET_DEVICE_PARAMETERS timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_UPD_CF_PAR__SET_DEV_PAR_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+                            $recv_mesg[1] != YIT_SET_DEVICE_PARAMETERS ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. SET_DEVICE_PARAMETERS error.");
+				goto error;
+			}
+			syslog(LOG_INFO, qq^Module parameter "${$nc_module_config[$pos]}{key}" updated.^);
+			$pos++;
+			$wri++;
+			$stm_states{$stm}->{job} = STM_UPD_CF_PAR__SET_DEV_PAR;
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_save_cf_par {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state $tmo;
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_SAVE_CF_PAR__SAVE_DEV_PAR) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x03;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_SAVE_DEVICE_PARAMETERS;
+			$send_data[5] = YIT_CONF_PARAM_TABLE;
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_SAVE_CF_PAR__SAVE_DEV_PAR_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_SAVE_CF_PAR__SAVE_DEV_PAR_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. SAVE_DEVICE_PARAMETERS timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_SAVE_CF_PAR__SAVE_DEV_PAR_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+                            $recv_mesg[1] != YIT_SAVE_DEVICE_PARAMETERS ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. SAVE_DEVICE_PARAMETERS error.");
+				goto error;
+			}
+			syslog(LOG_INFO, "$m ok.");
+			syslog(LOG_INFO, "$m. Reset request.");
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+		}
+		goto error;
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_clr_ndbase {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state $tmo;
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_CLR_NDBASE__DEL_NFO) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x03;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_DELETE_NODE_INFORMATION;
+			$send_data[5] = YIT_NODE_INFO_ALL_NODES;
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_CLR_NDBASE__DEL_NFO_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_CLR_NDBASE__DEL_NFO_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. DELETE_NODE_INFORMATION timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_CLR_NDBASE__DEL_NFO_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+                            $recv_mesg[1] != YIT_DELETE_NODE_INFORMATION ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. DELETE_NODE_INFORMATION error.");
+				goto error;
+			}
+			$clear_ndbase = FALSE;
+			syslog(LOG_INFO, "$m ok.");
+			if ($offline) {
+				$stm = 'stm_offline';
+				syslog(LOG_INFO, 'Network offline.');
+			} else {
+				$stm = 'stm_get_netid';
+				$stm_states{$stm}->{job} = STM_GET_NETID__GO_ONLINE;
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_get_netid {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state $tmo;
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_GET_NETID__GO_ONLINE) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x02;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_GO_ONLINE;
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_GET_NETID__GO_ONLINE_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_GET_NETID__GO_ONLINE_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. GO_ONLINE timeout.");
+				goto error;
+			}
+		} elsif ($stm_states{$stm}->{job} == STM_GET_NETID__NETID_WA_IND) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. NETWORK_ID_ASSIGNED timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_GET_NETID__GO_ONLINE_WA_RPL) {
+			if ($recv_mesg[0] != YIT_RESPONSE ||
+                            $recv_mesg[1] != YIT_GO_ONLINE ||
+                            $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+				syslog(LOG_INFO, "$m. GO_ONLINE error.");
+				goto error;
+			}
+			$tmo = $tms + NET_ID_IND_S_TMO;
+			$stm_states{$stm}->{job} = STM_GET_NETID__NETID_WA_IND;
+		} elsif ($stm_states{$stm}->{job} == STM_GET_NETID__NETID_WA_IND) {
+			if ($recv_mesg[0] != YIT_INDICATION || $recv_mesg[1] != YIT_NETWORK_ID_ASSIGNED) {
+				syslog(LOG_INFO, "$m. NETWORK_ID_ASSIGNED error.");
+				goto error;
+			}
+			$module{net_id} = le_w16(\@recv_mesg, 2);
+			syslog(LOG_INFO, "Network ID 0x@{[sprintf('%.4X', $module{net_id})]} assigned.");
+			$stm = 'stm_read_ndbase';
+			$stm_states{$stm}->{job} = STM_READ_NDBASE__GET_SZ;
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_read_ndbase {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state ($tmo, $aidx, $eidx);
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_READ_NDBASE__GET_SZ) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			foreach (keys(%rsdb)) {
+				$rsdb{$_}->{admitted} = 0;
+				$rsdb{$_}->{connected} = 0;
+				$rsdb{$_}->{node_id} = 0;
+				$rsdb{$_}->{parent_id} = 0;
+			}
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x03;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_GET_NC_DATABASE_SIZE;
+			$send_data[5] = 1;
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_READ_NDBASE__GET_SZ_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_READ_NDBASE__GET_SZ_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. GET_NC_DATABASE_SIZE timeout.");
+				goto error;
+			}
+		} elsif ($stm_states{$stm}->{job} == STM_READ_NDBASE__GET_NFO) {
+			get_rs_node_nfo(YIT_NODE_INFO_BY_NC_DB_IDX, $aidx);
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_READ_NDBASE__GET_NFO_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_READ_NDBASE__GET_NFO_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. GET_NODE_INFORMATION timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($recv_mesg[0] == YIT_RESPONSE) {
+			if ($stm_states{$stm}->{job} == STM_READ_NDBASE__GET_SZ_WA_RPL) {
+				if ($recv_mesg[1] != YIT_GET_NC_DATABASE_SIZE || $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+					syslog(LOG_INFO, "$m. GET_NC_DATABASE_SIZE error.");
+					goto error;
+				}
+				@{$stm_states{stm_upd_ndbase}->{del_sn}} = ();
+				$eidx = le_w16(\@recv_mesg, 5);
+				syslog(LOG_INFO, "$m. Last index in RS database is $eidx.") if $dbg;
+				$aidx = 0;
+				$stm_states{$stm}->{job} = STM_READ_NDBASE__GET_NFO;
+			} elsif ($stm_states{$stm}->{job} == STM_READ_NDBASE__GET_NFO_WA_RPL) {
+				if ($recv_mesg[1] == YIT_GET_NODE_INFORMATION) {
+					if ($recv_mesg[2] == YIT_COMMAND_SUCCESS) {
+						syslog(LOG_INFO, "$m. IDX$aidx @{[ndbase_item_nfo()]}.") if ($dbg);
+						my $sn = sn_ary_to_hex_str(\@recv_mesg, 7);
+						if (exists($rsdb{$sn})) {
+							$rsdb{$sn}->{node_id} = le_w16(\@recv_mesg, 3);
+							$rsdb{$sn}->{parent_id} = le_w16(\@recv_mesg, 5);
+							if ($recv_mesg[GET_NODE_NFO_CON_STAT_POS]) {
+								$rsdb{$sn}->{connected} = 1;
+							} else {
+								$rsdb{$sn}->{connected} = 0;
+							}
+							$rsdb{$sn}->{admitted} = 1;
+						} else {
+							push(@{$stm_states{stm_upd_ndbase}->{del_sn}}, $sn);
+						}
+					}
+					if (++$aidx > $eidx) {
+						syslog(LOG_INFO, "$m ok.") if $dbg;
+						if (scalar(@{$stm_states{stm_upd_ndbase}->{del_sn}})) {
+							$stm = 'stm_upd_ndbase';
+							$stm_states{$stm}->{job} = STM_UPD_NDBASE__DEL_NFO;
+						} else {
+							$stm = 'stm_scheduler';
+							$stm_states{$stm}->{bdata_tmo} = 0;
+							$stm_states{$stm}->{ucast_sched_tmo} = $tms;
+						}
+					} else {
+						get_rs_node_nfo(YIT_NODE_INFO_BY_NC_DB_IDX, $aidx);
+						$tmo = $tms + GEN_RPL_S_TMO;
+					}
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+					goto error;
+				}
+			} else {
+				syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+				goto error;
+			}
+		} elsif ($recv_mesg[0] == YIT_INDICATION) {
+			if ($recv_mesg[1] == YIT_RX_PACKET) {
+				rx_pkt_indication($tms);
+			} elsif ($recv_mesg[1] == YIT_GET_ADMISSION_APPROVAL_FROM_APP) {
+				syslog(LOG_INFO, "$m. @{[recv_mesg_nfo()]} ignored.") if $dbg;
+			} else {
+				gen_indication();
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_upd_ndbase {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state ($tmo, $sn);
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_UPD_NDBASE__DEL_NFO) {
+			syslog(LOG_INFO, "$m.") if $dbg;
+			$sn = shift(@{$stm_states{$stm}->{del_sn}});
+			del_rs_node_nfo_sn($sn);
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_UPD_NDBASE__DEL_NFO_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_UPD_NDBASE__DEL_NFO_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. DELETE_NODE_INFORMATION timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($recv_mesg[0] == YIT_RESPONSE) {
+			if ($stm_states{$stm}->{job} == STM_UPD_NDBASE__DEL_NFO_WA_RPL) {
+				if ($recv_mesg[1] != YIT_DELETE_NODE_INFORMATION || $recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+					syslog(LOG_INFO, "$m. DELETE_NODE_INFORMATION error.");
+					goto error;
+				}
+				syslog(LOG_INFO, "[$sn] deleted from IT700 node database.");
+				if (scalar(@{$stm_states{$stm}->{del_sn}})) {
+					$sn = shift(@{$stm_states{$stm}->{del_sn}});
+					del_rs_node_nfo_sn($sn);
+					$tmo = $tms + GEN_RPL_S_TMO;
+				} else {
+					syslog(LOG_INFO, "$m ok.") if $dbg;
+					$stm = 'stm_scheduler';
+					$stm_states{$stm}->{bdata_tmo} = 0;
+					$stm_states{$stm}->{ucast_sched_tmo} = $tms;
+				}
+			} else {
+				syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+				goto error;
+			}
+		} elsif ($recv_mesg[0] == YIT_INDICATION) {
+			if ($recv_mesg[1] == YIT_RX_PACKET) {
+				rx_pkt_indication($tms);
+			} elsif ($recv_mesg[1] == YIT_GET_ADMISSION_APPROVAL_FROM_APP) {
+				syslog(LOG_INFO, "$m. @{[recv_mesg_nfo()]} ignored.") if $dbg;
+			} else {
+				gen_indication();
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+};
+
+sub stm_node_nfo {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+	state ($tmo, $rs);
+
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_NODE_NFO__GET_NFO) {
+			if (admission_wait()) {
+				switch_to_stm_admission($stm, STM_NODE_NFO__GET_NFO);
+				return;
+			}
+			if (defined($stm_states{$stm}->{sn})) {
+				$rs = $stm_states{$stm}->{sn};
+			} else {
+				$rs = $stm_states{$stm}->{id};
+			}
+			syslog(LOG_INFO, "$m. [$rs].") if $dbg;
+			if (defined($stm_states{$stm}->{sn})) {
+				get_rs_node_nfo(YIT_NODE_INFO_BY_NODE_SN, $rs);
+			} else {
+				get_rs_node_nfo(YIT_NODE_INFO_BY_NODE_ID, $rs);
+			}
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_NODE_NFO__GET_NFO_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_NODE_NFO__GET_NFO_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. GET_NODE_INFORMATION timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($recv_mesg[0] == YIT_RESPONSE) {
+			if ($stm_states{$stm}->{job} == STM_NODE_NFO__GET_NFO_WA_RPL) {
+				if ($recv_mesg[1] == YIT_GET_NODE_INFORMATION) {
+					if ($recv_mesg[2] == YIT_COMMAND_SUCCESS) {
+						my $sn = sn_ary_to_hex_str(\@recv_mesg, 7);
+						if (defined($stm_states{$stm}->{sn})) {
+							if ($stm_states{$stm}->{sn} ne $sn) {
+								syslog(LOG_INFO, "$m. GET_NODE_INFORMATION error. (SN not match).");
+								goto error;
+							}
+						}
+						if (exists($rsdb{$sn})) {
+							$rsdb{$sn}->{node_id} = le_w16(\@recv_mesg, 3);
+							$rsdb{$sn}->{parent_id} = le_w16(\@recv_mesg, 5);
+							if ($recv_mesg[GET_NODE_NFO_CON_STAT_POS]) {
+								$rsdb{$sn}->{connected} = 1;
+							} else {
+								$rsdb{$sn}->{connected} = 0;
+							}
+							$rsdb{$sn}->{admitted} = 1;
+							syslog(LOG_INFO, "$m. RSDB item [$sn] updated. (admitted = 1).") if ($dbg);
+						} else {
+							syslog(LOG_INFO, "$m. RS [$rs] not exist in RSDB.");
+							goto error;
+						}
+					} else {
+						if (defined($stm_states{$stm}->{sn})) {
+							$rsdb{$rs}->{admitted} = 0;
+							$rsdb{$rs}->{connected} = 0;
+							$rsdb{$rs}->{node_id} = 0;
+							$rsdb{$rs}->{parent_id} = 0;
+							syslog(LOG_INFO, "$m. RSDB item [$rs] updated. (admitted = 0).") if ($dbg);
+						}
+					}
+					$stm = 'stm_scheduler';
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+					goto error;
+				}
+			} else {
+				syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+				goto error;
+			}
+		} elsif ($recv_mesg[0] == YIT_INDICATION) {
+			if ($recv_mesg[1] == YIT_RX_PACKET) {
+				rx_pkt_indication($tms);
+			} elsif ($recv_mesg[1] == YIT_GET_ADMISSION_APPROVAL_FROM_APP) {
+				unless (admission_wait()) {
+					init_admission_request();
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]} in RS admission process.");
+					goto error;
+				}
+			} else {
+				gen_indication();
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_offline {
+	my $evnt = shift();
+	state $m = $stm_states{$stm}->{m};
+
+	if ($evnt == RECV_MESG_EVENT) {
+		if ($recv_mesg[0] == YIT_INDICATION) {
+			syslog(LOG_INFO, "$m. @{[recv_mesg_nfo()]}.");
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub stm_scheduler {
+	my ($evnt, $tms) = (shift(), shift());
+	state $m = $stm_states{$stm}->{m};
+
+	unless ($stm_states{$stm}->{in}) {
+		syslog(LOG_INFO, "$m.") if ($dbg);
+		$stm_states{$stm}->{in} = TRUE;
+	}
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($offline) {
+			$stm = 'stm_rst_mod';
+			$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+			syslog(LOG_INFO, "$m. Reset request.");
+			return;
+		}
+		if ($tms >= $stm_states{$stm}->{ucast_sched_tmo}) {
+			$stm_states{$stm}->{ucast_sched_tmo} = $tms + UCAST_SCHED_TMO;
+			ucast_sched($tms);
+		}
+		if (admission_wait()) {
+			switch_to_stm_admission($stm, 0);
+			return;
+		}
+		if (scalar(@node_nfo_fifo)) {
+			$stm_states{$stm}->{in} = FALSE;
+			my $n = shift(@node_nfo_fifo);
+			$stm = 'stm_node_nfo';
+			if (length($n) == 32) {
+				$stm_states{$stm}->{sn} = $n;
+				$stm_states{$stm}->{id} = undef();
+			} else {
+				$stm_states{$stm}->{sn} = undef();
+				$stm_states{$stm}->{id} = $n;
+			}
+			$stm_states{$stm}->{job} = STM_NODE_NFO__GET_NFO;
+			return;
+		}
+		if ($tms >= $stm_states{$stm}->{last_txp_tms} + $txp_delay_s_tmo) {
+			if ($tms >= $stm_states{$stm}->{bdata_tmo}) {
+				$stm_states{$stm}->{bdata_tmo} = $tms + $bcast_period_s_tmo;
+				$stm_states{$stm}->{last_txp_tms} = $tms;
+				$stm_states{$stm}->{in} = FALSE;
+				$stm = 'stm_txpacket';
+				$stm_states{$stm}->{sn} = undef();
+				@{$stm_states{$stm}->{tx_pkt_trans_mesg}} = ();
+				$stm_states{$stm}->{job} = STM_TXPACKET__TXP;
+				return;
+			} else {
+				if (scalar(@unicast_fifo)) {
+					$stm_states{$stm}->{last_txp_tms} = $tms;
+					$stm_states{$stm}->{in} = FALSE;
+					$stm = 'stm_txpacket';
+					$stm_states{$stm}->{sn} = shift(@unicast_fifo);
+					@{$stm_states{$stm}->{tx_pkt_trans_mesg}} = ();
+					$stm_states{$stm}->{job} = STM_TXPACKET__TXP;
+					return;
+				}
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($recv_mesg[0] == YIT_INDICATION) {
+			if ($recv_mesg[1] == YIT_RX_PACKET) {
+				rx_pkt_indication($tms);
+			} elsif ($recv_mesg[1] == YIT_GET_ADMISSION_APPROVAL_FROM_APP) {
+				unless (admission_wait()) {
+					init_admission_request();
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]} in RS admission process.");
+					goto error;
+				}
+			} else {
+				gen_indication();
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub ucast_sched {
+	my $tms = shift();
+	state $state;
+	state $m = 'RS unicast process';
+	state (@rslist, $tmo);
+
+	if ($reset_ucast_sched) {
+		foreach (keys(%rsdb)) {
+			$rsdb{$_}->{ucast_time} = 0;
+			$rsdb{$_}->{ucast_pending} = 0;
+		}
+		@unicast_fifo = ();
+		$tmo = $tms + $mycfg{start_unicasts_delay};
+		$state = UCAST_SCHED__WA_IDLE;
+		$reset_ucast_sched = FALSE;
+		syslog(LOG_INFO, "Scheduler. $m init.") if ($dbg);
+	}
+	if ($state == UCAST_SCHED__INIT_LIST) {
+		@rslist = ();
+		foreach (keys(%rsdb)) {
+			if ($rsdb{$_}->{admitted} && $rsdb{$_}->{connected}) {
+				$rsdb{$_}->{ucast_pending} = 1;
+				push(@rslist, $_);
+			}
+		}
+		if (scalar(@rslist)) {
+			push(@unicast_fifo, sort({$rsdb{$a}->{parent_id} <=> $rsdb{$b}->{parent_id}} @rslist));
+			$state = UCAST_SCHED__WA_RS_RPL;
+			syslog(LOG_INFO, "$m begins. RS list size is @{[scalar(@rslist)]}.") if ($dbg);
+		} else {
+			$tmo = $tms + $mycfg{next_unicasts_delay};
+			$state = UCAST_SCHED__WA_IDLE;
+		}
+	} elsif ($state == UCAST_SCHED__WA_RS_RPL) {
+		my $act = 0;
+		foreach (@rslist) {
+			next unless (defined($_));
+			unless ($rsdb{$_}->{ucast_pending}) {
+				$rsdb{$_}->{ucast_time} = 0;
+				$_ = undef();
+				next;
+			}
+			if ($rsdb{$_}->{ucast_time} == 0) {
+				$act++;
+				next;
+			}
+			if ($tms - $rsdb{$_}->{ucast_time} > UCAST_SESSION_TMO) {
+				syslog(LOG_INFO, "$m attempt $rsdb{$_}->{ucast_pending}. [$_] error.") if ($dbg);
+				if ($rsdb{$_}->{ucast_pending} == 1) {
+					$rsdb{$_}->{session_1_tmo_cnt}++;
+				}
+				$rsdb{$_}->{ucast_time} = 0;
+				if (++$rsdb{$_}->{ucast_pending} > 3) {
+					$rsdb{$_}->{session_tmo_cnt}++;
+					$rsdb{$_}->{ucast_pending} = 0;
+					$_ = undef();
+					next;
+				} else {
+					if ($rsdb{$_}->{admitted} && $rsdb{$_}->{connected}) {
+						unshift(@unicast_fifo, $_);
+					} else {
+						$rsdb{$_}->{ucast_pending} = 0;
+						$_ = undef();
+						next;
+					}
+				}
+			}
+			$act++;
+		}
+		unless ($act) {
+			$tmo = $tms + $mycfg{next_unicasts_delay};
+			$state = UCAST_SCHED__WA_IDLE;
+			syslog(LOG_INFO, "$m done.") if ($dbg);
+		}
+	} elsif ($state == UCAST_SCHED__WA_IDLE) {
+		if ($tms > $tmo) {
+			$state = UCAST_SCHED__INIT_LIST;
+		}
+	}
+}
+
+sub stm_txpacket {
+	my ($evnt, $tms, $m) = (shift(), shift());
+	state $tmo;
+
+	if (defined($stm_states{$stm}->{sn})) {
+		$m = 'Unicast';
+		$m .= ' once' if (scalar(@{$rsdb{$stm_states{$stm}->{sn}}->{unicast_once_data}}));
+	} else {
+		$m = 'Broadcast';
+	}
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_TXPACKET__TXP) {
+			if (admission_wait()) {
+				switch_to_stm_admission($stm, STM_TXPACKET__TXP);
+				return;
+			}
+			if (++$tx_pkt_tag > 65535) {
+				$tx_pkt_tag = 1;
+			}
+			if ($dbg) {
+				my $sn = defined($stm_states{$stm}->{sn}) ? " [$stm_states{$stm}->{sn}]" : '';
+				syslog(LOG_INFO, "$m$sn. Session tag $tx_pkt_tag.");
+			}
+			if (defined($stm_states{$stm}->{sn})) {
+				if ($rsdb{$stm_states{$stm}->{sn}}->{admitted} && $rsdb{$stm_states{$stm}->{sn}}->{connected}) {
+					$rsdb{$stm_states{$stm}->{sn}}->{ucast_time} = $tms;
+					$rsdb{$stm_states{$stm}->{sn}}->{ucast_session} = $tx_pkt_tag;
+					if (scalar(@{$rsdb{$stm_states{$stm}->{sn}}->{unicast_once_data}})) {
+						$rsdb{$stm_states{$stm}->{sn}}->{ucast_once} = 1;
+						send_unicast_data($stm_states{$stm}->{sn}, $rsdb{$stm_states{$stm}->{sn}}->{unicast_once_data});
+					} else {
+						$rsdb{$stm_states{$stm}->{sn}}->{ucast_once} = 0;
+						send_unicast_data($stm_states{$stm}->{sn}, $rsdb{$stm_states{$stm}->{sn}}->{unicast_data});
+					}
+				} else {
+					$rsdb{$stm_states{$stm}->{sn}}->{ucast_pending} = 0;
+					$stm = 'stm_scheduler';
+					return;
+				}
+			} else {
+				send_broadcast_data();
+			}
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_TXPACKET__WA_ADM_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_TXPACKET__WA_ADM_RPL) {
+			if ($tms > $tmo) {
+				$yit_stats{txp_adm_tmo_cnt}++;
+				syslog(LOG_INFO, "$m. TX_PACKET admission timeout. (Mesg: @{[field_nfo($mesg_recv_state, \%mesg_recv_state_txt)]}).");
+				goto error;
+			}
+		} elsif ($stm_states{$stm}->{job} == STM_TXPACKET__WA_TRN_RPL) {
+			if (admission_wait()) {
+				switch_to_stm_admission($stm, STM_TXPACKET__WA_TRN_RPL);
+				return;
+			}
+			if (scalar(@{$stm_states{$stm}->{tx_pkt_trans_mesg}})) {
+				my $r = $stm_states{$stm}->{tx_pkt_trans_mesg};
+				if ((my $tg = le_w16($r, 7)) != $tx_pkt_tag) {
+					$yit_stats{trn_tag_err_cnt}++;
+					syslog(LOG_INFO, "$m. TX_PACKET transmission: bad session tag $tg.");
+					goto error;
+				}
+				if (${$r}[2] == YIT_COMMAND_SUCCESS) {
+					if (defined($stm_states{$stm}->{sn})) {
+						$yit_stats{ucast_txp_cnt}++;
+						unless ($rsdb{$stm_states{$stm}->{sn}}->{ucast_once}) {
+							$rsdb{$stm_states{$stm}->{sn}}->{unicast_cnt}++;
+						}
+					} else {
+						$yit_stats{bcast_txp_cnt}++;
+						$stm_states{$stm}->{bcast_count}++;
+					}
+				} else {
+					$yit_stats{txp_trn_err_cnt}++;
+					$rsdb{$stm_states{$stm}->{sn}}->{txp_trn_err_cnt}++ if (defined($stm_states{$stm}->{sn}));
+				}
+				syslog(LOG_INFO, "$m. TX_PACKET transmission: @{[field_nfo(${$r}[4], \%yit_trs_res_txt)]}.") if ($dbg);
+				$stm = 'stm_scheduler';
+				return;
+			}
+			if ($tms > $tmo) {
+				$yit_stats{txp_trn_tmo_cnt}++;
+				syslog(LOG_INFO, "$m. TX_PACKET transmission timeout. (Mesg: @{[field_nfo($mesg_recv_state, \%mesg_recv_state_txt)]}).");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($recv_mesg[0] == YIT_RESPONSE) {
+			if ($stm_states{$stm}->{job} == STM_TXPACKET__WA_ADM_RPL) {
+				if ($recv_mesg[1] == YIT_TX_PACKET && $recv_mesg[3] == YIT_TX_PKT_ADMIS) {
+					if ((my $tg = le_w16(\@recv_mesg, 5)) != $tx_pkt_tag) {
+						$yit_stats{adm_tag_err_cnt}++;
+						syslog(LOG_INFO, "$m. TX_PACKET admission: bad session tag $tg.");
+						goto error;
+					}
+					if ($recv_mesg[2] == YIT_COMMAND_SUCCESS) {
+						if ($dbg) {
+							syslog(LOG_INFO, "$m. TX_PACKET admission: @{[field_nfo($recv_mesg[4], \%yit_adm_res_txt)]}.");
+						}
+						if (admission_wait()) {
+							switch_to_stm_admission($stm, STM_TXPACKET__WA_TRN_RPL);
+						} else {
+							$stm_states{$stm}->{job} = STM_TXPACKET__WA_TRN_RPL;
+						}
+					} else {
+						if (defined($stm_states{$stm}->{sn}) && $recv_mesg[4] == YIT_ADM_RESULT_REJECTED_NODE_NOT_FOUND) {
+							$rsdb{$stm_states{$stm}->{sn}}->{ucast_pending} = 0;
+							push(@node_nfo_fifo, $stm_states{$stm}->{sn});
+						}
+						$yit_stats{txp_adm_err_cnt}++;
+						$rsdb{$stm_states{$stm}->{sn}}->{txp_adm_err_cnt}++ if (defined($stm_states{$stm}->{sn}));
+						syslog(LOG_INFO, "$m. TX_PACKET admission: @{[field_nfo($recv_mesg[4], \%yit_adm_res_txt)]}.");
+						$stm = 'stm_scheduler';
+					}
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}. (Job $stm_states{$stm}->{job}).");
+					goto error;
+				}
+			} elsif ($stm_states{$stm}->{job} == STM_TXPACKET__WA_TRN_RPL) {
+				if ($recv_mesg[1] == YIT_TX_PACKET && $recv_mesg[3] == YIT_TX_PKT_TRANS) {
+					if ((my $tg = le_w16(\@recv_mesg, 7)) != $tx_pkt_tag) {
+						$yit_stats{trn_tag_err_cnt}++;
+						syslog(LOG_INFO, "$m. TX_PACKET transmission: bad session tag $tg.");
+						goto error;
+					}
+					if ($recv_mesg[2] == YIT_COMMAND_SUCCESS) {
+						if (defined($stm_states{$stm}->{sn})) {
+							$yit_stats{ucast_txp_cnt}++;
+							unless ($rsdb{$stm_states{$stm}->{sn}}->{ucast_once}) {
+								$rsdb{$stm_states{$stm}->{sn}}->{unicast_cnt}++;
+							}
+						} else {
+							$yit_stats{bcast_txp_cnt}++;
+							$stm_states{$stm}->{bcast_count}++;
+						}
+					} else {
+						$yit_stats{txp_trn_err_cnt}++;
+						$rsdb{$stm_states{$stm}->{sn}}->{txp_trn_err_cnt}++ if (defined($stm_states{$stm}->{sn}));
+					}
+					syslog(LOG_INFO, "$m. TX_PACKET transmission: @{[field_nfo($recv_mesg[4], \%yit_trs_res_txt)]}.") if ($dbg);
+					$stm = 'stm_scheduler';
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}. (Job $stm_states{$stm}->{job}).");
+					goto error;
+				}
+			} else {
+				syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}. (Job $stm_states{$stm}->{job}).");
+				goto error;
+			}
+		} elsif ($recv_mesg[0] == YIT_INDICATION) {
+			if ($recv_mesg[1] == YIT_RX_PACKET) {
+				rx_pkt_indication($tms);
+			} elsif ($recv_mesg[1] == YIT_GET_ADMISSION_APPROVAL_FROM_APP) {
+				unless (admission_wait()) {
+					init_admission_request();
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]} in RS admission process.");
+					goto error;
+				}
+			} else {
+				gen_indication();
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}. (Job $stm_states{$stm}->{job}).");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub init_admission_request {
+	$stm_states{stm_admission}->{sn} = sn_ary_to_hex_str(\@recv_mesg, 2);
+	@{$stm_states{stm_admission}->{data}} = @recv_mesg[2 .. 30];
+	if ($dbg) {
+		my $s;
+		if ($stm eq 'stm_txpacket') {
+			if (defined($stm_states{$stm}->{sn})) {
+				$s = 'Unicast';
+				$s .= ' once' if (scalar(@{$rsdb{$stm_states{$stm}->{sn}}->{unicast_once_data}}));
+			} else {
+				$s = 'Broadcast';
+			}
+		} else {
+			$s = $stm_states{$stm}->{m};
+		}
+		syslog(LOG_INFO, "$s. [$stm_states{stm_admission}->{sn}] admission request.");
+	}
+}
+
+sub undef_admission_request {
+	$stm_states{stm_admission}->{sn} = undef();
+}
+
+sub admission_wait {
+	if (defined($stm_states{stm_admission}->{sn})) {
+		return TRUE;
+	} else {
+		return FALSE;
+	}
+}
+
+sub switch_to_stm_admission {
+	my ($s, $j) = (shift(), shift());
+
+	$stm = 'stm_admission';
+	$stm_states{$stm}->{ret_stm} = $s;
+	$stm_states{$stm}->{ret_job} = $j;
+	$stm_states{$stm}->{job} = STM_ADMISSION__ADM_APPR;
+}
+
+sub stm_admission {
+	my ($evnt, $tms) = (shift(), shift());
+	my $m = "$stm_states{$stm}->{m}. ";
+	state ($tmo, $adm);
+
+	if ($stm_states{$stm}->{ret_stm} eq 'stm_txpacket') {
+		if (defined($stm_states{stm_txpacket}->{sn})) {
+			if (scalar(@{$rsdb{$stm_states{stm_txpacket}->{sn}}->{unicast_once_data}})) {
+				$m .= '(Unicast once)';
+			} else {
+				$m .= '(Unicast)';
+			}
+		} else {
+			$m .= '(Broadcast)';
+		}
+	} else {
+		$m .= "($stm_states{$stm_states{$stm}->{ret_stm}}->{m})";
+	}
+	if ($evnt == TIME_PASS_EVENT) {
+		if ($stm_states{$stm}->{job} == STM_ADMISSION__ADM_APPR) {
+			if (exists($rsdb{$stm_states{$stm}->{sn}})) {
+				$adm = YIT_ADMIT_RS;
+			} else {
+				$adm = YIT_REFUSE_RS;
+			}
+			@send_data = ();
+			$send_data[0] = MESG_FLAG;
+			$send_data[1] = 0x21;
+			$send_data[2] = 0x00;
+			$send_data[3] = YIT_REQUEST;
+			$send_data[4] = YIT_ADMISSION_APPROVAL_RESP_FROM_APP;
+			w16_le(\@send_data, 5, $adm);
+			for (my $i = 0; $i < 29; $i++) {
+				$send_data[$i + 7] = ${$stm_states{$stm}->{data}}[$i];
+			}
+			send_mesg();
+			$tmo = $tms + GEN_RPL_S_TMO;
+			$stm_states{$stm}->{job} = STM_ADMISSION__ADM_APPR_WA_RPL;
+		} elsif ($stm_states{$stm}->{job} == STM_ADMISSION__ADM_APPR_WA_RPL) {
+			if ($tms > $tmo) {
+				syslog(LOG_INFO, "$m. ADMISSION_APPROVAL_RESP_FROM_APP timeout.");
+				goto error;
+			}
+		}
+	} elsif ($evnt == RECV_MESG_EVENT) {
+		if ($recv_mesg[0] == YIT_RESPONSE) {
+			if ($recv_mesg[1] == YIT_ADMISSION_APPROVAL_RESP_FROM_APP) {
+				if ($stm_states{$stm}->{job} == STM_ADMISSION__ADM_APPR_WA_RPL) {
+					if ($recv_mesg[2] != YIT_COMMAND_SUCCESS) {
+						syslog(LOG_INFO, "$m. ADMISSION_APPROVAL_RESP_FROM_APP error.");
+						goto error;
+					}
+					if ($dbg) {
+						my $st = $adm == YIT_ADMIT_RS ? 'accepted' : 'refused';
+						syslog(LOG_INFO, "$m. [$stm_states{$stm}->{sn}] admission $st.");
+					} else {
+						syslog(LOG_INFO, "[$stm_states{$stm}->{sn}] admission refused.") if ($adm == YIT_REFUSE_RS);
+					}
+					if ($adm == YIT_ADMIT_RS) {
+						$rsdb{$stm_states{$stm}->{sn}}->{admission_cnt}++;
+						push(@node_nfo_fifo, $stm_states{$stm}->{sn});
+					}
+					$stm_states{$stm}->{sn} = undef();
+					$stm = $stm_states{$stm}->{ret_stm};
+					$stm_states{$stm}->{job} = $stm_states{stm_admission}->{ret_job};
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+					goto error;
+				}
+			} elsif ($recv_mesg[1] == YIT_TX_PACKET && $recv_mesg[3] == YIT_TX_PKT_TRANS) {
+				if ($stm_states{$stm}->{ret_stm} eq 'stm_txpacket') {
+					unless (scalar(@{$stm_states{stm_txpacket}->{tx_pkt_trans_mesg}})) {
+						@{$stm_states{stm_txpacket}->{tx_pkt_trans_mesg}} = @recv_mesg;
+					} else {
+						syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+						goto error;
+					}
+				} else {
+					syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+					goto error;
+				}
+			} else {
+				syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+				goto error;
+			}
+		} elsif ($recv_mesg[0] == YIT_INDICATION) {
+			if ($recv_mesg[1] == YIT_RX_PACKET) {
+				rx_pkt_indication($tms);
+			} elsif ($recv_mesg[1] == YIT_GET_ADMISSION_APPROVAL_FROM_APP) {
+				syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]} in admission process.");
+				goto error;
+			} else {
+				gen_indication();
+			}
+		} else {
+			syslog(LOG_INFO, "$m. Unexpected @{[recv_mesg_nfo()]}.");
+			goto error;
+		}
+	}
+	return;
+error:
+	$stm = 'stm_rst_mod';
+	$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+}
+
+sub gen_indication {
+	if ($recv_mesg[1] == YIT_CONNECTIVITY_STATUS_WITH_RS) {
+		my $sn = sn_ary_to_hex_str(\@recv_mesg, 4);
+		if (exists($rsdb{$sn})) {
+			if ($recv_mesg[20]) {
+				$rsdb{$sn}->{connected} = 1;
+				syslog(LOG_INFO, "[$sn] connect to network.") if ($dbg);
+			} else {
+				$rsdb{$sn}->{connected} = 0;
+				syslog(LOG_INFO, "[$sn] disconnect from network.") if ($dbg);
+			}
+		} else {
+			syslog(LOG_INFO, "CONNECTIVITY_STATUS_WITH_RS indication error, unknown [$sn].") if ($sn ne '0' x 32);
+		}
+	} elsif ($recv_mesg[1] == YIT_NODE_LEFT_NETWORK) {
+		my $sn = sn_ary_to_hex_str(\@recv_mesg, 4);
+		if (exists($rsdb{$sn})) {
+			$rsdb{$sn}->{admitted} = 0;
+			$rsdb{$sn}->{connected} = 0;
+			$rsdb{$sn}->{node_id} = 0;
+			$rsdb{$sn}->{parent_id} = 0;
+			syslog(LOG_INFO, "[$sn] left network. (@{[field_nfo($recv_mesg[20], \%yit_node_left_net)]}).") if ($dbg);
+		} else {
+			syslog(LOG_INFO, "NODE_LEFT_NETWORK indication error, unknown [$sn].") if ($sn ne '0' x 32);
+		}
+	} elsif ($recv_mesg[1] == YIT_NEW_CONNECTION_TO_NC) {
+		push(@node_nfo_fifo, le_w16(\@recv_mesg, 2));
+		syslog(LOG_INFO, "New node join to network. (node_id=@{[le_w16(\@recv_mesg, 2)]} parent_id=@{[le_w16(\@recv_mesg, 4)]}).") if ($dbg);
+	} elsif ($recv_mesg[1] == YIT_NETWORK_ID_ASSIGNED) {
+		$module{net_id} = le_w16(\@recv_mesg, 2);
+		syslog(LOG_INFO, "New network ID 0x@{[sprintf('%.4X', $module{net_id})]} assigned.");
+	} else {
+		syslog(LOG_INFO, "Unexpected @{[recv_mesg_nfo()]} in gen_indication().");
+	}
+}
+
+sub rx_pkt_indication {
+	my $tms = shift();
+	my ($sn, @data);
+
+	if ($recv_mesg[6] > 7 && $recv_mesg[6] < 12) {
+		if ($recv_mesg[17]) {
+			$sn = sn_ary_to_hex_str(\@recv_mesg, 18);
+		} else {
+			syslog(LOG_INFO, 'Error. Received packet with short address.');
+			return;
+		}
+	} else {
+		$yit_stats{rxp_inter_cnt}++;
+		syslog(LOG_INFO, "Received INTERNET @{[$recv_mesg[3] ? 'BCAST' : 'UCAST']} packet. [@{[sn_ary_to_hex_str(\@recv_mesg, 11)]}].") if ($dbg);
+		return;
+	}
+	if ($recv_mesg[3]) {
+		$yit_stats{rxp_bcast_cnt}++;
+		syslog(LOG_INFO, "Received INTRANET BCAST packet. [$sn].");
+		return;
+	}
+	unless (exists($rsdb{$sn})) {
+		$yit_stats{rxp_bad_sn_cnt}++;
+		syslog(LOG_INFO, "Received INTRANET UCAST packet with bad SN. [$sn].");
+		return;
+	}
+	$rsdb{$sn}->{rx_sig_qual} = $recv_mesg[5];
+	unless ($rsdb{$sn}->{ucast_pending}) {
+		$yit_stats{rxp_ord_err_cnt}++;
+		$rsdb{$sn}->{rxp_ord_err_cnt}++;
+		syslog(LOG_INFO, "Received data packet out of order. [$sn].");
+		return;
+	}
+	if ($mycfg{data_integrity}) {
+		my ($plsz, $crc, $end, $i) = (@recv_mesg - RECV_MESG_DATA_POS, DATA_CRC_INIT, $#recv_mesg - 3, 0);
+		if ($plsz < 4) {
+			syslog(LOG_INFO, "Received data packet with short data size. [$sn].");
+			goto end;
+		}
+		for (; $i < $plsz - 1; $i++) {
+			$crc = update_crc($crc, $recv_mesg[$i + RECV_MESG_DATA_POS]);
+		}
+		if ($crc == $recv_mesg[$i + RECV_MESG_DATA_POS]) {
+			if (le_w16(\@recv_mesg, $end + 1) != $rsdb{$sn}->{ucast_session}) {
+				$yit_stats{rxp_tag_err_cnt}++;
+				$rsdb{$sn}->{rxp_tag_err_cnt}++;
+				syslog(LOG_INFO, "Received data packet with bad session tag. [$sn].");
+				goto end;
+			}
+			@data = @recv_mesg[RECV_MESG_DATA_POS .. $end];
+			syslog(LOG_INFO, "Received data packet. (Session @{[le_w16(\@recv_mesg, $end + 1)]}). [$sn].") if ($dbg);
+		} else {
+			$yit_stats{rxp_crc_err_cnt}++;
+			$rsdb{$sn}->{rxp_crc_err_cnt}++;
+			syslog(LOG_INFO, "Received data packet with bad CRC. [$sn].");
+			goto end;
+		}
+	} else  {
+		@data = @recv_mesg[RECV_MESG_DATA_POS .. $#recv_mesg];
+		unless (scalar(@data)) {
+			syslog(LOG_INFO, "Received data packet with short data size. [$sn].");
+			goto end;
+		}
+		syslog(LOG_INFO, "Received data packet. [$sn].") if ($dbg);
+	}
+	$rsdb{$sn}->{recv_rpl_tms} = $tms;
+	if ($rsdb{$sn}->{ucast_once}) {
+		@{$rsdb{$sn}->{unicast_once_data}} = ();
+	}
+	if (scalar(@{$rsdb{$sn}->{recv_data_ref_fifo}}) == $mycfg{node_data_queue_size}) {
+		shift(@{$rsdb{$sn}->{recv_data_ref_fifo}});
+	}
+	push(@{$rsdb{$sn}->{recv_data_ref_fifo}}, \@data);
+end:
+	$rsdb{$sn}->{ucast_pending} = 0;
+}
+
+sub send_broadcast_data {
+	my ($crc, $dsz) = (DATA_CRC_INIT, scalar(@bcdata));
+
+	@send_data = ();
+	$send_data[0] = MESG_FLAG;
+	w16_le(\@send_data, 1, 11 + ($mycfg{data_integrity} ? $dsz + 1 : $dsz));
+	$send_data[3] = YIT_REQUEST;
+	$send_data[4] = YIT_TX_PACKET;
+	$send_data[5] = YIT_DATA_SERV_INTRA_BROADCAST;
+	$send_data[6] = YIT_PKT_PRIO_NORMAL;
+	$send_data[7] = YIT_PKT_SERV_NO_ACK;
+	$send_data[8] = $mycfg{yi_max_network_depth};
+	$send_data[9] = $mycfg{transmit_gain};
+	w16_le(\@send_data, 10, $tx_pkt_tag);
+	$send_data[12] = YIT_TX_ENCRYPTED_0;
+	$send_data[13] = 0x00;
+	for (my $i = 0; $i < $dsz; $i++) {
+		if ($mycfg{data_integrity}) {
+			$crc = update_crc($crc, $bcdata[$i]);
+		}
+		$send_data[$i + 14] = $bcdata[$i];
+	}
+	push(@send_data, $crc) if ($mycfg{data_integrity});
+	send_mesg();
+}
+
+sub send_unicast_data {
+	my ($crc, $sn, $r_d, $dsz) = (DATA_CRC_INIT, shift(), shift());
+
+	$dsz = scalar(@{$r_d});
+	@send_data = ();
+	$send_data[0] = MESG_FLAG;
+	w16_le(\@send_data, 1, 27 + ($mycfg{data_integrity} ? $dsz + 3 : $dsz));
+	$send_data[3] = YIT_REQUEST;
+	$send_data[4] = YIT_TX_PACKET;
+	$send_data[5] = YIT_DATA_SERV_INTRA_UNICAST_SN;
+	$send_data[6] = YIT_PKT_PRIO_NORMAL;
+	$send_data[7] = YIT_PKT_SERV_NO_ACK;
+	$send_data[8] = $mycfg{yi_max_network_depth};
+	$send_data[9] = $rsdb{$sn}->{transmit_gain};
+	w16_le(\@send_data, 10, $tx_pkt_tag);
+	$send_data[12] = YIT_TX_ENCRYPTED_0;
+	$send_data[13] = 0x00;
+	push(@send_data, @{$rsdb{$sn}->{sn_ary}});
+	for (my $i = 0; $i < $dsz; $i++) {
+		if ($mycfg{data_integrity}) {
+			$crc = update_crc($crc, $r_d->[$i]);
+		}
+		push(@send_data, $r_d->[$i]);
+	}
+	if ($mycfg{data_integrity}) {
+		foreach ($tx_pkt_tag & 0xFF, $tx_pkt_tag >> 8) {
+			$crc = update_crc($crc, $_);
+			push(@send_data, $_);
+		}
+		push(@send_data, $crc);
+	}
+	send_mesg();
+}
+
+sub get_rs_node_nfo {
+	my ($key, $rs) = (shift(), shift());
+
+	@send_data = ();
+	$send_data[0] = MESG_FLAG;
+	if ($key == YIT_NODE_INFO_BY_NODE_SN) {
+		w16_le(\@send_data, 1, 19);
+	} else {
+		w16_le(\@send_data, 1, 5);
+	}
+	$send_data[3] = YIT_REQUEST;
+	$send_data[4] = YIT_GET_NODE_INFORMATION;
+	$send_data[5] = $key;
+	if ($key == YIT_NODE_INFO_BY_NODE_SN) {
+		hex_sn_to_ary($rs, \@send_data, 6);
+	} else {
+		w16_le(\@send_data, 6, $rs);
+	}
+	send_mesg();
+}
+
+sub del_rs_node_nfo_sn {
+	my $sn = shift();
+
+	@send_data = ();
+	$send_data[0] = MESG_FLAG;
+	w16_le(\@send_data, 1, 19);
+	$send_data[3] = YIT_REQUEST;
+	$send_data[4] = YIT_DELETE_NODE_INFORMATION;
+	$send_data[5] = YIT_NODE_INFO_BY_NODE_SN;
+	hex_sn_to_ary($sn, \@send_data, 6);
+	send_mesg();
+}
+
+sub cmd_handler {
+	my $rpl;
+
+	if ($cmd_tokens[0] eq 'nop') {
+		$rpl = cmd_nop();
+	} elsif ($cmd_tokens[0] eq 'mesg-stats') {
+		$rpl = cmd_mesg_stats();
+	} elsif ($cmd_tokens[0] eq 'log-it700-config') {
+		$rpl = cmd_log_it700_config();
+	} elsif ($cmd_tokens[0] eq 'reset') {
+		$rpl = cmd_reset();
+	} elsif ($cmd_tokens[0] eq 'yit-stats') {
+		$rpl = cmd_yit_stats();
+	} elsif ($cmd_tokens[0] eq 'set-txp-delay') {
+		$rpl = cmd_set_txp_delay();
+	} elsif ($cmd_tokens[0] eq 'set-broadcast-period') {
+		$rpl = cmd_set_broadcast_period();
+	} elsif ($cmd_tokens[0] eq 'get-broadcast-data') {
+		$rpl = cmd_get_broadcast_data();
+	} elsif ($cmd_tokens[0] eq 'set-broadcast-data') {
+		$rpl = cmd_set_broadcast_data();
+	} elsif ($cmd_tokens[0] eq 'get-broadcast-count') {
+		$rpl = cmd_get_broadcast_count();
+	} elsif ($cmd_tokens[0] eq 'set-rs-unicast-once-data') {
+		$rpl = cmd_set_rs_unicast_once_data();
+	} elsif ($cmd_tokens[0] eq 'set-rs-unicast-data') {
+		$rpl = cmd_set_rs_unicast_data();
+	} elsif ($cmd_tokens[0] eq 'get-rs-info') {
+		$rpl = cmd_get_rs_info();
+	} elsif ($cmd_tokens[0] eq 'clear-ndbase') {
+		$rpl = cmd_clear_ndbase();
+	} elsif ($cmd_tokens[0] eq 'go-network-offline') {
+		$rpl = cmd_go_network_offline();
+	} elsif ($cmd_tokens[0] eq 'sync-rsdb-with-ndbase') {
+		$rpl = cmd_sync_rsdb_with_ndbase();
+	} elsif ($cmd_tokens[0] eq 'set-rs-transmit-gain') {
+		$rpl = cmd_set_rs_transmit_gain();
+	} else {
+		$rpl = "error: unknown command\n";
+	}
+	if (defined($rpl)) {
+		unless (syswrite($c_sock, $rpl)) {
+			syslog(LOG_INFO, qq^Can't write to client socket "$socket". System error: $!.^);
+		}
+	}
+}
+
+#
+# No operation.
+#
+# -> txt(nop)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_nop {
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		return "ok:\n";
+	}
+}
+
+#
+# Messages statistics.
+#
+# -> txt(mesg-stats)
+# <- txt(ok:) txt(send_mesg:) txt(cnt=)num(n) txt(recv_mesg:) txt(cnt=)num(n) txt(sum_error_cnt=)num(n) txt(sync_error_cnt=)num(n)\
+#     txt(size_error_cnt=)num(n)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_mesg_stats {
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		my $s = "ok: send_mesg: cnt=$mesg_stats{send_mesg_cnt}";
+		$s .= " recv_mesg: cnt=$mesg_stats{recv_mesg_cnt}";
+		$s .= " sum_error_cnt=$mesg_stats{sum_error_cnt}";
+		$s .= " sync_error_cnt=$mesg_stats{sync_error_cnt}";
+		$s .= " size_error_cnt=$mesg_stats{size_error_cnt}";
+		return "$s\n";
+	}
+}
+
+#
+# Print @module_config to syslog.
+#
+# -> txt(log-it700-config)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_log_it700_config {
+	my $m;
+
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		foreach (@module_config) {
+			$m = qq^IT700 config "${$_}{txt}" = ^;
+			$m .= defined(${$_}{act}) ? ${$_}{act} : 'undef';
+			if (defined(${$_}{act})) {
+				$m .= ${$_}{act} != ${$_}{rom} ? " (rom = ${$_}{rom})" : '';
+			} else {
+				$m .= " (rom = ${$_}{rom})";
+			}
+			syslog(LOG_INFO, "$m");
+		}
+		return "ok:\n";
+	}
+}
+
+#
+# Reset module.
+#
+# -> txt(reset)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_reset {
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		$offline = FALSE;
+		$stm = 'stm_rst_mod';
+		$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+		syslog(LOG_INFO, 'Reset request by client.');
+		return "ok:\n";
+	}
+}
+
+#
+# Yitran protocol statistics.
+#
+# -> txt(yit-stats)
+# <- txt(ok:)\
+#     txt(rst_try_cnt=)num(n)\
+#     txt(rst_cnt=)num(n)\
+#     txt(bcast_txp_cnt=)num(n)\
+#     txt(ucast_txp_cnt=)num(n)\
+#     txt(adm_tag_err_cnt=)num(n)\
+#     txt(trn_tag_err_cnt=)num(n)\
+#     txt(txp_adm_err_cnt=)num(n)\
+#     txt(txp_adm_tmo_cnt=)num(n)\
+#     txt(txp_trn_err_cnt=)num(n)\
+#     txt(txp_trn_tmo_cnt=)num(n)\
+#     txt(rxp_inter_cnt=)num(n)\
+#     txt(rxp_bcast_cnt=)num(n)\
+#     txt(rxp_bad_sn_cnt=)num(n)\
+#     txt(rxp_ord_err_cnt=)num(n)\
+#     txt(rxp_tag_err_cnt=)num(n)\
+#     txt(rxp_crc_err_cnt=)num(n)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_yit_stats {
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		my $s = "ok: rst_try_cnt=$yit_stats{rst_try_cnt} ";
+		$s .= "rst_cnt=$yit_stats{rst_cnt} ";
+		$s .= "bcast_txp_cnt=$yit_stats{bcast_txp_cnt} ";
+		$s .= "ucast_txp_cnt=$yit_stats{ucast_txp_cnt} ";
+		$s .= "adm_tag_err_cnt=$yit_stats{adm_tag_err_cnt} ";
+                $s .= "trn_tag_err_cnt=$yit_stats{trn_tag_err_cnt} ";
+		$s .= "txp_adm_err_cnt=$yit_stats{txp_adm_err_cnt} ";
+                $s .= "txp_adm_tmo_cnt=$yit_stats{txp_adm_tmo_cnt} ";
+		$s .= "txp_trn_err_cnt=$yit_stats{txp_trn_err_cnt} ";
+                $s .= "txp_trn_tmo_cnt=$yit_stats{txp_trn_tmo_cnt} ";
+		$s .= "rxp_inter_cnt=$yit_stats{rxp_inter_cnt} ";
+		$s .= "rxp_bcast_cnt=$yit_stats{rxp_bcast_cnt} ";
+		$s .= "rxp_bad_sn_cnt=$yit_stats{rxp_bad_sn_cnt} ";
+		$s .= "rxp_ord_err_cnt=$yit_stats{rxp_ord_err_cnt} ";
+		$s .= "rxp_tag_err_cnt=$yit_stats{rxp_tag_err_cnt} ";
+		$s .= "rxp_crc_err_cnt=$yit_stats{rxp_crc_err_cnt}";
+		return "$s\n";
+	}
+}
+
+#
+# Set tx packet delay.
+#
+# -> txt(set-txp-delay) num(seconds)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_set_txp_delay {
+	if (@cmd_tokens != 2 || $cmd_tokens[1] !~ /^\d$/ || $cmd_tokens[1] =~ /^0/ || $cmd_tokens[1] > 5) {
+		return "error: invalid parameters\n";
+	} else {
+		$txp_delay_s_tmo = $cmd_tokens[1];
+		return "ok:\n";
+	}
+}
+
+#
+# Set broadcast period.
+#
+# -> txt(set-broadcast-period) num(seconds)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_set_broadcast_period {
+	if (@cmd_tokens != 2 || $cmd_tokens[1] !~ /^\d{2,3}$/ || $cmd_tokens[1] =~ /^0/ || $cmd_tokens[1] > 600) {
+		return "error: invalid parameters\n";
+	} else {
+		$bcast_period_s_tmo = $cmd_tokens[1];
+		$stm_states{stm_scheduler}->{bdata_tmo} = 0;
+		return "ok:\n";
+	}
+}
+
+#
+# Get broadcast data.
+#
+# -> txt(get-broadcast-data)
+# <- txt(ok:) num(n0) [num(n1) .. num(nx)]
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_get_broadcast_data {
+	my $s = 'ok: ';
+
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		for (my $i = 0; $i < scalar(@bcdata); $i++) {
+			if ($i == 0) {
+				$s .= $bcdata[0];
+			} else {
+				$s .= " $bcdata[$i]";
+			}
+		}
+		return "$s\n";
+	}
+}
+
+#
+# Set broadcast data.
+#
+# -> txt(set-broadcast-data) num(n0) [num(n1) .. num(nx)]
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_set_broadcast_data {
+	unless ($cmd_pending) {
+		if (@cmd_tokens < 2) {
+			return "error: invalid parameters\n";
+		}
+		for (my $i = 1; $i < @cmd_tokens; $i++) {
+			if ($cmd_tokens[$i] !~ /^\d{1,3}$/ || $cmd_tokens[$i] =~ /^0\d+/ || $cmd_tokens[$i] > 255) {
+				return "error: invalid parameters\n";
+			}
+		}
+		if ($stm eq 'stm_txpacket' && !defined($stm_states{$stm}->{sn})) {
+			$cmd_pending = TRUE;
+			return undef();
+		} else {
+			$stm_states{stm_txpacket}->{bcast_count} = 0;
+			@bcdata = @cmd_tokens[1 .. $#cmd_tokens];
+			$stm_states{stm_scheduler}->{bdata_tmo} = 0;
+			return "ok:\n";
+		}
+	} else {
+		if ($stm eq 'stm_txpacket') {
+			return undef();
+		} else {
+			$stm_states{stm_txpacket}->{bcast_count} = 0;
+			@bcdata = @cmd_tokens[1 .. $#cmd_tokens];
+			$stm_states{stm_scheduler}->{bdata_tmo} = 0;
+			$cmd_pending = FALSE;
+			return "ok:\n";
+		}
+	}
+}
+
+#
+# Get broadcast count.
+#
+# -> txt(get-broadcast-count)
+# <- txt(ok:) num(count)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_get_broadcast_count {
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		return "ok: $stm_states{stm_txpacket}->{bcast_count}\n";
+	}
+}
+
+#
+# Set remote station unicast once data.
+#
+# -> txt(set-rs-unicast-once-data) sn(rs serial) num(n0) [num(n1) .. num(nx)]
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+# <- txt(error:) txt(invalid sn)
+#
+sub cmd_set_rs_unicast_once_data {
+	state $sn;
+
+	unless ($cmd_pending) {
+		if (@cmd_tokens < 3) {
+			return "error: invalid parameters\n";
+		}
+		for (my $i = 2; $i < @cmd_tokens; $i++) {
+			if ($cmd_tokens[$i] !~ /^\d{1,3}$/ || $cmd_tokens[$i] =~ /^0\d+/ || $cmd_tokens[$i] > 255) {
+				return "error: invalid parameters\n";
+			}
+		}
+		if ($cmd_tokens[1] !~ /^$sn_rex$/) {
+			return "error: invalid parameters\n";
+		}
+		$sn = uc($cmd_tokens[1]);
+		unless (exists($rsdb{$sn})) {
+			return "error: invalid sn\n";
+		}
+		if (rs_ucast_data_locked($sn)) {
+			$cmd_pending = TRUE;
+			return undef();
+		} else {
+			@{$rsdb{$sn}->{unicast_once_data}} = @cmd_tokens[2 .. $#cmd_tokens];
+			return "ok:\n";
+		}
+	} else {
+		if (rs_ucast_data_locked($sn)) {
+			return undef();
+		} else {
+			@{$rsdb{$sn}->{unicast_once_data}} = @cmd_tokens[2 .. $#cmd_tokens];
+			$cmd_pending = FALSE;
+			return "ok:\n";
+		}
+	}
+}
+
+#
+# Set remote station unicast data.
+#
+# -> txt(set-rs-unicast-data) sn(rs serial) num(n0) [num(n1) .. num(nx)]
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+# <- txt(error:) txt(invalid sn)
+#
+sub cmd_set_rs_unicast_data {
+	state $sn;
+
+	unless ($cmd_pending) {
+		if (@cmd_tokens < 3) {
+			return "error: invalid parameters\n";
+		}
+		for (my $i = 2; $i < @cmd_tokens; $i++) {
+			if ($cmd_tokens[$i] !~ /^\d{1,3}$/ || $cmd_tokens[$i] =~ /^0\d+/ || $cmd_tokens[$i] > 255) {
+				return "error: invalid parameters\n";
+			}
+		}
+		if ($cmd_tokens[1] !~ /^$sn_rex$/) {
+			return "error: invalid parameters\n";
+		}
+		$sn = uc($cmd_tokens[1]);
+		unless (exists($rsdb{$sn})) {
+			return "error: invalid sn\n";
+		}
+		if (rs_ucast_data_locked($sn)) {
+			$cmd_pending = TRUE;
+			return undef();
+		} else {
+			$rsdb{$sn}->{unicast_cnt} = 0;
+			@{$rsdb{$sn}->{unicast_data}} = @cmd_tokens[2 .. $#cmd_tokens];
+			return "ok:\n";
+		}
+	} else {
+		if (rs_ucast_data_locked($sn)) {
+			return undef();
+		} else {
+			$rsdb{$sn}->{unicast_cnt} = 0;
+			@{$rsdb{$sn}->{unicast_data}} = @cmd_tokens[2 .. $#cmd_tokens];
+			$cmd_pending = FALSE;
+			return "ok:\n";
+		}
+	}
+}
+
+#
+# Get remote station info.
+#
+# -> txt(get-rs-info) sn(rs serial)
+# <- txt(ok:)\
+#     txt(admitted=)bool(b)\
+#     txt(connected=bool(b)\
+#     txt(node_id=)num(n)\
+#     txt(parent_id=)num(n)\
+#     txt(reply_time_ago=)num(sec)\
+#     txt(unicast_cnt=)num(n)\
+#     txt(session_1_tmo_cnt=)num(n)\
+#     txt(session_tmo_cnt=)num(n)\
+#     txt(transmit_gain=)num(n)\
+#     txt(txp_adm_err_cnt=)num(n)\
+#     txt(txp_trn_err_cnt=)num(n)\
+#     txt(admission_cnt=)num(n)\
+#     txt(rxp_ord_err_cnt=)num(n)\
+#     txt(rxp_tag_err_cnt=)num(n)\
+#     txt(rxp_crc_err_cnt=)num(n)\
+#     txt(rx_sig_qual=)num(n)\
+#     txt(rs_unicast_once_data=)[num(n0)] [num(n1) .. num(nx)]\
+#     txt(rs_unicast_data=)num(n0) [num(n1) .. num(nx)]\
+#     txt(recv_data=)[num(n0) .. num(nx) txt(end)num(0)] .. [num(n0) .. num(nx) txt(end)num(n)]
+# <- txt(error:) txt(invalid parameters)
+# <- txt(error:) txt(invalid sn)
+#
+sub cmd_get_rs_info {
+	my ($sn, $s);
+
+	if (@cmd_tokens != 2) {
+		return "error: invalid parameters\n";
+	}
+	if ($cmd_tokens[1] !~ /^$sn_rex$/) {
+		return "error: invalid parameters\n";
+	}
+	$sn = uc($cmd_tokens[1]);
+	unless (exists($rsdb{$sn})) {
+		return "error: invalid sn\n";
+	}
+	$s = "ok: admitted=$rsdb{$sn}->{admitted} ";
+	$s .= "connected=$rsdb{$sn}->{connected} ";
+	$s .= "node_id=$rsdb{$sn}->{node_id} ";
+	$s .= "parent_id=$rsdb{$sn}->{parent_id} ";
+	if ($rsdb{$sn}->{recv_rpl_tms}) {
+		$s .= "reply_time_ago=@{[sprintf('%d', clock_gettime(CLOCK_MONOTONIC) - $rsdb{$sn}->{recv_rpl_tms})]} ";
+	} else {
+		$s .= "reply_time_ago=err ";
+	}
+	$s .= "unicast_cnt=$rsdb{$sn}->{unicast_cnt} ";
+	$s .= "session_1_tmo_cnt=$rsdb{$sn}->{session_1_tmo_cnt} ";
+	$s .= "session_tmo_cnt=$rsdb{$sn}->{session_tmo_cnt} ";
+	$s .= "transmit_gain=$rsdb{$sn}->{transmit_gain} ";
+	$s .= "txp_adm_err_cnt=$rsdb{$sn}->{txp_adm_err_cnt} ";
+	$s .= "txp_trn_err_cnt=$rsdb{$sn}->{txp_trn_err_cnt} ";
+	$s .= "admission_cnt=$rsdb{$sn}->{admission_cnt} ";
+	$s .= "rxp_ord_err_cnt=$rsdb{$sn}->{rxp_ord_err_cnt} ";
+	$s .= "rxp_tag_err_cnt=$rsdb{$sn}->{rxp_tag_err_cnt} ";
+	$s .= "rxp_crc_err_cnt=$rsdb{$sn}->{rxp_crc_err_cnt} ";
+	$s .= "rx_sig_qual=$rsdb{$sn}->{rx_sig_qual} ";
+	$s .= "rs_unicast_once_data=";
+	for (my $i = 0; $i < scalar(@{$rsdb{$sn}->{unicast_once_data}}); $i++) {
+		if ($i == 0) {
+			$s .= ${$rsdb{$sn}->{unicast_once_data}}[0];
+		} else {
+			$s .= " ${$rsdb{$sn}->{unicast_once_data}}[$i]";
+		}
+	}
+	$s .= " rs_unicast_data=";
+	for (my $i = 0; $i < scalar(@{$rsdb{$sn}->{unicast_data}}); $i++) {
+		if ($i == 0) {
+			$s .= ${$rsdb{$sn}->{unicast_data}}[0];
+		} else {
+			$s .= " ${$rsdb{$sn}->{unicast_data}}[$i]";
+		}
+	}
+	$s .= " recv_data=";
+	my $n = -1;
+	while (scalar(@{$rsdb{$sn}->{recv_data_ref_fifo}})) {
+		if (++$n > 0) {
+			$s .= " ";
+		}
+		my $rf = shift(@{$rsdb{$sn}->{recv_data_ref_fifo}});
+		for (my $i = 0; $i < scalar(@{$rf}); $i++) {
+			if ($i == 0) {
+				$s .= ${$rf}[0];
+			} else {
+				$s .= " ${$rf}[$i]";
+			}
+		}
+		$s .= " end$n";
+	}
+	return "$s\n";
+}
+
+#
+# Clear node database.
+#
+# -> txt(clear-ndbase)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_clear_ndbase {
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		$clear_ndbase = TRUE;
+		$stm = 'stm_rst_mod';
+		$stm_states{$stm}->{job} = STM_RST_MOD__INIT;
+		syslog(LOG_INFO, 'Reset request by client.');
+		return "ok:\n";
+	}
+}
+
+#
+# Go to network offline mode.
+#
+# -> txt(go-network-offline)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_go_network_offline {
+	unless ($cmd_pending) {
+		if (@cmd_tokens > 1) {
+			return "error: invalid parameters\n";
+		}
+		$offline = TRUE;
+		$cmd_pending = TRUE;
+		return undef();
+	} else {
+		if ($stm ne 'stm_offline') {
+			return undef();
+		} else {
+			$cmd_pending = FALSE;
+			return "ok:\n";
+		}
+	}
+}
+
+#
+# Synchronize RSDB with IT700 node database.
+#
+# -> txt(sync-rsdb-with-ndbase)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+#
+sub cmd_sync_rsdb_with_ndbase {
+	if (@cmd_tokens > 1) {
+		return "error: invalid parameters\n";
+	} else {
+		push(@node_nfo_fifo, keys(%rsdb));
+		return "ok:\n";
+	}
+}
+
+#
+# Set transmit gain for RS.
+#
+# -> txt(set-rs-transmit-gain) sn(rs serial) num(tx gain)
+# <- txt(ok:)
+# <- txt(error:) txt(invalid parameters)
+# <- txt(error:) txt(invalid sn)
+#
+sub cmd_set_rs_transmit_gain {
+	my $sn;
+
+	if (@cmd_tokens != 3) {
+		return "error: invalid parameters\n";
+	}
+	if ($cmd_tokens[1] !~ /^$sn_rex$/) {
+		return "error: invalid parameters\n";
+	}
+	$sn = uc($cmd_tokens[1]);
+	unless (exists($rsdb{$sn})) {
+		return "error: invalid sn\n";
+	}
+	if ($cmd_tokens[2] !~ /^\d$/ || $cmd_tokens[2] > 7) {
+		return "error: invalid parameters\n";
+	}
+	$rsdb{$sn}->{transmit_gain} = $cmd_tokens[2];
+	return "ok:\n";
+}
+
+sub rs_ucast_data_locked {
+	my $sn = shift();
+
+	if ($stm eq 'stm_txpacket' && defined($stm_states{$stm}->{sn}) && $stm_states{$stm}->{sn} eq $sn) {
+		return TRUE;
+	} else {
+		return FALSE;
+	}
+}
+
+sub w16_le {
+	my ($r_ar, $of, $n) = ($_[0], $_[1], $_[2]);
+
+	${$r_ar}[$of] = $n & 0xFF;
+	${$r_ar}[$of + 1] = $n >> 8;
+}
+
+sub le_w16 {
+	my ($r_ar, $of, $n) = ($_[0], $_[1]);
+
+	$n = ${$r_ar}[$of + 1];
+	$n <<= 8;
+	$n |= ${$r_ar}[$of];
+	return $n;
+}
+
+sub w32_le {
+	my ($r_ar, $of, $n) = ($_[0], $_[1], $_[2]);
+
+	for (my $i = 0; $i < 4; $i++) {
+		${$r_ar}[$of + $i] = $n & 0xFF;
+		$n >>= 8;
+	}
+}
+
+sub le_w32 {
+	my ($r_ar, $of, $n) = ($_[0], $_[1]);
+
+	$n = ${$r_ar}[$of + 3];
+	$n <<= 8;
+	$n |= ${$r_ar}[$of + 2];
+	$n <<= 8;
+	$n |= ${$r_ar}[$of + 1];
+	$n <<= 8;
+	$n |= ${$r_ar}[$of];
+	return $n;
+}
+
+sub update_crc {
+	my ($crc, $val) = (shift(), shift());
+
+	for (my $i = 0; $i < 8; $i++, $val >>= 1) {
+		if ((($crc ^ $val) & 0x01) != 0) {
+			$crc = ($crc >> 1) ^ 0x8C;
+		} else {
+			$crc >>= 1;
+		}
+	}
+	return $crc;
+}
+
+sub get_idx_by_key {
+	my ($r_ary, $key) = (shift(), shift());
+
+	for (my $i = 0; $i < scalar(@{$r_ary}); $i++) {
+		if (${${$r_ary}[$i]}{key} eq $key) {
+			return $i;
+		}
+	}
+	return undef();
+}
+
+sub field_nfo {
+	my ($n, $r_hash) = (shift(), shift());
+
+	if (exists(${$r_hash}{$n})) {
+		return ${$r_hash}{$n};
+	} else {
+		return "0x@{[sprintf('%.2X', $n)]}";
+	}
+}
+
+sub recv_mesg_nfo {
+	my $s;
+
+	$s = "'@{[field_nfo($recv_mesg[0], \%yit_mesg_type_txt)]} ";
+	$s .= "@{[field_nfo($recv_mesg[1], \%yit_command_txt)]}";
+	$s .= "_@{[field_nfo($recv_mesg[3], \%yit_tx_pkt_type)]}" if ($recv_mesg[1] == YIT_TX_PACKET);
+	$s .= '\'';
+	return $s;
+}
+
+sub ndbase_item_nfo {
+	my $s;
+
+	$s = "[@{[sn_ary_to_hex_str(\@recv_mesg, 7)]}] node_id=@{[le_w16(\@recv_mesg, 3)]} parent_id=@{[le_w16(\@recv_mesg, 5)]}. ";
+	$s .= field_nfo($recv_mesg[GET_NODE_NFO_CON_STAT_POS], \%yit_rs_con_stat);
+	return "$s";
+}
+
+sub sn_ary_to_hex_str {
+	my ($r_ary, $pos, $s) = ($_[0], 0);
+
+	if (scalar(@_) > 1) {
+		$pos = $_[1];
+	}
+	for (my ($i, $j) = (0, 15); $i < 16; $i++, $j--) {
+		$s .= sprintf('%.2X', ${$r_ary}[$pos + $j]);
+	}
+	return $s;
+}
+
+sub hex_sn_to_ary {
+        my ($sn, $r_ary, $pos) = ($_[0], $_[1], 0);
+
+	if (scalar(@_) > 2) {
+		$pos = $_[2];
+	}
+	for (my $i = 0; $i < 16; $i++) {
+		my $h = chop($sn);
+		$h = chop($sn) . $h;
+		$r_ary->[$pos + $i] = hex($h);
+	}
+}
+
+sub hex_str_to_ary {
+	my ($r_ary, $s, $pos, $sz) = ($_[0], $_[1], $_[2]);
+
+	$sz = length($s);
+	$s = reverse($s);
+	for (my $i = 0; $i < $sz / 2; $i++) {
+		my $h = chop($s);
+		$h .= chop($s);
+		$r_ary->[$pos + $i] = hex($h);
+	}
+}
+
+sub log_mesg {
+	my ($new, $col, $data) = (TRUE, 0);
+	my ($r_ary, $dir, $ary_sz, $i) = (shift(), shift());
+
+	if ($dir == MESG_DIR_SEND) {
+		$i = 3;
+	} else {
+		$i = 0;
+	}
+	$ary_sz = scalar(@{$r_ary});
+	for (; $i < $ary_sz; $i++) {
+		if ($new) {
+			$new = FALSE;
+			if ($dir == MESG_DIR_SEND) {
+				$data = $i == 3 ? '-> ' : '   ';
+			} else {
+				$data = $i == 0 ? '<- ' : '   ';
+			}
+		}
+		if (++$col == MESG_LOG_COLS || $i == $ary_sz - 1) {
+			$data .= sprintf('%.2X', ${$r_ary}[$i]);
+			syslog(LOG_INFO, $data);
+			$new = TRUE;
+			$col = 0;
+		} else {
+			$data .= sprintf('%.2X ', ${$r_ary}[$i]);
+		}
+	}
+}
+
+sub set_priority {
+	my $pri = shift();
+
+	$! = 0;
+	setpriority(0, 0, $pri);
+	if ($! != 0) {
+		syslog(LOG_ERR, "Can't set $I process priority. System error: $!.");
+		error_exit();
+	}
+}
+
+sub do_fork {
+	my $ppid;
+
+	unless (defined(my $cp = fork())) {
+		syslog(LOG_ERR, "Can't fork. System error: $!.");
+		error_exit();
+	} else {
+		if ($cp) {
+			return;
+		}
+	}
+	$SIG{USR1} = 'IGNORE';
+	$SIG{TERM} = 'IGNORE';
+	$proc_type = CHILD_PROCESS;
+	$ppid = getppid();
+	unless ($pid_fh->write("$$\n")) {
+		syslog(LOG_ERR, qq^Can't write to file "$pid_file". System error: $!.^);
+		goto error;
+	}
+	if (-1 == setsid()) {
+		syslog(LOG_ERR, "Can't create new session. System error: $!.");
+		goto error;
+	}
+	syslog(LOG_INFO, "Parent: PID=$ppid PGID=@{[getpgrp($ppid)]} SSID=@{[c_getsid($ppid)]}.") if ($dbg > 1);
+	syslog(LOG_INFO, "Child: PID=$$ PGID=@{[getpgrp(0)]} SSID=@{[c_getsid(0)]}.") if ($dbg > 1);
+	unless (chdir('/')) {
+		syslog(LOG_ERR, qq^Can't chdir to "/". System error: $!.^);
+		goto error;
+	}
+	unless (close(STDIN)) {
+		syslog(LOG_ERR, "Can't close STDIN. System error: $!.");
+		goto error;
+	}
+	unless (open(STDIN, '<', '/dev/null')) {
+		syslog(LOG_ERR, qq^Can't open STDIN from "/dev/null". System error: $!.^);
+		goto error;
+	}
+	unless (close(STDOUT)) {
+		syslog(LOG_ERR, "Can't close STDOUT. System error: $!.");
+		goto error;
+	}
+	unless (open(STDOUT, '>', '/dev/null')) {
+		syslog(LOG_ERR, qq^Can't open STDOUT to "/dev/null". System error: $!.^);
+		goto error;
+	}
+	unless (close(STDERR)) {
+		syslog(LOG_ERR, "Can't close STDERR. System error: $!.");
+		goto error;
+	}
+	unless (open(STDERR, '>', '/dev/null')) {
+		syslog(LOG_ERR, qq^Can't open STDERR to "/dev/null". System error: $!.^);
+		goto error;
+	}
+	unless (kill('TERM' => $ppid)) {
+		syslog(LOG_ERR, "SIGTERM to pid $ppid failed. System error: $!.");
+		error_exit();
+	}
+	return;
+error:
+	kill('USR1' => $ppid) || syslog(LOG_ERR, "SIGUSR1 to pid $ppid failed. System error: $!.");
+	error_exit();
+}
+
+sub check_signals {
+	if ($sig_hup) {
+		$sig_hup = 0;
+		syslog(LOG_INFO, 'Signal HUP received.');
+	}
+	if ($sig_usr1) {
+		$sig_usr1 = 0;
+		syslog(LOG_INFO, 'Signal USR1 received.');
+	}
+	if ($sig_int) {
+		$sig_int = 0;
+		if ($proc_type == PARENT_PROCESS) {
+			syslog(LOG_INFO, 'Terminated by INT signal.');
+			exit(0);
+		} else {
+			syslog(LOG_INFO, 'Signal INT received.');
+		}
+	}
+	if ($sig_term) {
+		if ($proc_type == PARENT_PROCESS) {
+			syslog(LOG_INFO, 'Terminated by TERM signal.');
+		} else {
+			syslog(LOG_INFO, 'Daemon terminated by TERM signal.');
+		}
+		exit(0);
+	}
+}
+
+sub create_s_socket {
+	my $res;
+
+	$res = socket($s_sock,
+                      $sock_type == UNIX_SOCKET ? PF_UNIX : PF_INET,
+                      SOCK_STREAM,
+                      $sock_type == UNIX_SOCKET ? 0 : getprotobyname('tcp'));
+	unless ($res) {
+		syslog(LOG_ERR, qq^Can't create @{[$sock_type == UNIX_SOCKET ? 'PF_UNIX' : 'PF_INET']} socket "$socket". System error: $!.^);
+		undef($s_sock);
+		error_exit();
+	}
+	if ($sock_type == INET_SOCKET) {
+		unless (setsockopt($s_sock, SOL_SOCKET, SO_REUSEADDR, 1)) {
+			syslog(LOG_ERR, qq^Setsockopt SOL_SOCKET failed on PF_INET socket "$socket". System error: $!.^);
+			error_exit();
+		}
+	} else {
+		if (-e $socket) {
+			unless (unlink($socket)) {
+				syslog(LOG_ERR, qq^Can't unlink file "$socket". System error: $!.^);
+				error_exit();
+			}
+		}
+	}
+	my $adr;
+	if ($sock_type == UNIX_SOCKET) {
+		$adr = sockaddr_un($socket);
+	} else {
+		$socket =~ /^(?:loopback|\*):(\d{4,5})$/;
+		my $p = $1;
+		if ($socket =~ /^l/) {
+			$adr = sockaddr_in($p, INADDR_LOOPBACK);
+		} else {
+			$adr = sockaddr_in($p, INADDR_ANY);
+		}
+	}
+	unless (bind($s_sock, $adr)) {
+		syslog(LOG_ERR, qq^Can't bind socket "$socket". System error: $!.^);
+		error_exit();
+	}
+	if ($sock_type == UNIX_SOCKET) {
+		unless (chmod(0660, $socket)) {
+			syslog(LOG_ERR, qq^Can't set file "$socket" permissions to 0660. System error: $!.^);
+			error_exit();
+		}
+	}
+	my $fl;
+	unless ($fl = fcntl($s_sock, F_GETFL, 0)) {
+		syslog(LOG_ERR, qq^Fcntl F_GETFL failed on file "$socket". System error: $!.^);
+		error_exit();
+	}
+	unless (fcntl($s_sock, F_SETFL, $fl | O_NONBLOCK)) {
+		syslog(LOG_ERR, qq^Fcntl F_SETFL failed on file "$socket". System error: $!.^);
+		error_exit();
+	}
+	unless (listen($s_sock, 1)) {
+		syslog(LOG_ERR, qq^Can't listen on socket "$socket". System error: $!.^);
+		error_exit();
+	}
+}
+
+use constant {
+	B2400	=> 013,
+	B4800	=> 014,
+	B9600	=> 015,
+	B19200	=> 016,
+	B38400	=> 017,
+};
+
+use constant {
+	CSIZE	=> 060,
+	CS8     => 060,
+	CSTOPB  => 0100,
+	CREAD   => 0200,
+	PARENB  => 0400,
+	HUPCL   => 02000,
+	CLOCAL  => 04000,
+	CRTSCTS => 020000000000,
+};
+
+use constant {
+	OPOST   => 01,
+};
+
+use constant {
+	ISIG	=> 01,
+	ICANON	=> 02,
+	ECHO	=> 010,
+	ECHOE	=> 020,
+	ECHONL	=> 0100,
+	IEXTEN	=> 0100000,
+};
+
+use constant {
+	IGNBRK	=> 01,
+	BRKINT	=> 02,
+	PARMRK	=> 010,
+	INPCK	=> 020,
+	ISTRIP	=> 040,
+	INLCR	=> 0100,
+	IGNCR	=> 0200,
+	ICRNL	=> 0400,
+	IXON	=> 02000,
+	IXANY	=> 04000,
+	IXOFF	=> 010000,
+};
+
+use constant {
+	VTIME   => 5,
+	VMIN    => 6,
+};
+
+sub open_serial_port {
+	my ($attr, $br);
+
+	$port = IO::File->new();
+	unless ($port->open($mycfg{serial_port_file}, O_RDWR | O_NOCTTY | O_NONBLOCK)) {
+		syslog(LOG_ERR, qq^Can't open file "$mycfg{serial_port_file}". System error: $!.^);
+		undef($port);
+		error_exit();
+	}
+	unless (isatty($port)) {
+		syslog(LOG_ERR, qq^File "$mycfg{serial_port_file}" is not tty.^);
+		error_exit();
+	}
+	$attr = POSIX::Termios->new();
+	unless ($attr->getattr(fileno($port))) {
+		syslog(LOG_ERR, qq^Can't get tty attributes for file "$mycfg{serial_port_file}". System error: $!.^);
+		error_exit();
+	}
+	my $n = $attr->getcflag();
+	$n &= ~(PARENB | CSTOPB | CRTSCTS | HUPCL | CSIZE);
+	$n |= CLOCAL | CREAD | CS8;
+	$attr->setcflag($n);
+	$attr->setlflag($attr->getlflag() & ~(ICANON | ISIG | ECHO | IEXTEN));
+	$attr->setiflag($attr->getiflag() & ~(BRKINT | ICRNL | IGNBRK | IGNCR | INLCR | INPCK | ISTRIP | IXON | IXOFF | IXANY | PARMRK));
+	$attr->setoflag($attr->getoflag() & ~OPOST);
+	$attr->setcc(VMIN, 0);
+	$attr->setcc(VTIME, 0);
+switch_br:
+	{
+		if ($mycfg{serial_port_speed} == 2400) {
+			$br = B2400;
+			last switch_br;
+		}
+		if ($mycfg{serial_port_speed} == 4800) {
+			$br = B4800;
+			last switch_br;
+		}
+		if ($mycfg{serial_port_speed} == 9600) {
+			$br = B9600;
+			last switch_br;
+		}
+		if ($mycfg{serial_port_speed} == 19200) {
+			$br = B19200;
+			last switch_br;
+		}
+		if ($mycfg{serial_port_speed} == 38400) {
+			$br = B38400;
+			last switch_br;
+		}
+	}
+	unless ($attr->setispeed($br) && $attr->setospeed($br)) {
+		syslog(LOG_ERR, "Can't set tty speed attributes. System error: $!.");
+		error_exit();
+	}
+	unless ($attr->setattr(fileno($port), &POSIX::TCSANOW)) {
+		syslog(LOG_ERR, qq^Can't set tty attributes on file "$mycfg{serial_port_file}". System error: $!.^);
+		error_exit();
+	}
+}
+
+sub flush_port_recv_buf {
+	unless ($port->ioctl(TCFLSH, 0)) {
+		syslog(LOG_ERR, qq^Ioctl TCFLSH failed on file "$mycfg{serial_port_file}". System error: $!.^);
+		error_exit();
+	}
+}
+
+sub parse_mycfg {
+	local $_;
+	my ($fn, $fh) = "/etc/$I" . '.conf';
+
+	unless (open($fh, '<', $fn)) {
+		syslog(LOG_ERR, qq^Can't open file "$fn". System error: $!.^);
+		error_exit();
+	}
+fh:	while (<$fh>) {
+		chomp();
+		next if (m!^\s*#|^\s*$!);
+		if (/^\s*(?<key>$mycfg_key_rex)\s*=\s*(?<val>$mycfg_val_rex)\s*$/) {
+			foreach (@mycfg_keys) {
+				if ($+{key} eq $_) {
+					my ($key, $val) = ($+{key}, $+{val});
+					if ($val =~ /^(")(.*)\1$/) {
+						$mycfg{$key} = $2;
+					} else {
+						$mycfg{$key} = $val;
+					}
+					next fh;
+				}
+			}
+			syslog(LOG_ERR, qq^Unknown key '$+{key}' found in file "$fn".^);
+			error_exit();
+		} else {
+			syslog(LOG_ERR, qq^Wrong format of line $. in file "$fn": ($_).^);
+			error_exit();
+		}
+	}
+	unless (close($fh)) {
+		syslog(LOG_ERR, qq^Can't close file "$fn". System error: $!.^);
+		error_exit();
+	}
+	if (exists($mycfg{control_socket})) {
+		if ($mycfg{control_socket} =~ m!^(?:loopback|\*):(\d{4,5})$!) {
+			if ($1 < 1024 || $1 > 65535) {
+				syslog(LOG_ERR, "Config key 'control_socket' has forbidden port number: '$1'.");
+				error_exit();
+			}
+			$socket = $mycfg{control_socket};
+			$sock_type = INET_SOCKET;
+		} elsif ($mycfg{control_socket} =~ /^[[:digit:][:lower:]]+$/) {
+			$socket = "/run/$I/" . $mycfg{control_socket};
+			$sock_type = UNIX_SOCKET;
+		} else {
+			syslog(LOG_ERR, "Config key 'control_socket' has bad value: '$mycfg{control_socket}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'control_socket' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{serial_port_file})) {
+		if ($mycfg{serial_port_file} !~ m!^/dev/\w+$!) {
+			syslog(LOG_ERR, qq^Config key 'serial_port_file' has bad value: "$mycfg{serial_port_file}".^);
+			error_exit();
+		}
+		unless (-e $mycfg{serial_port_file}) {
+			syslog(LOG_ERR, qq^File "$mycfg{serial_port_file}" in config key 'serial_port_file' does not exist.^);
+			error_exit();
+		}
+		unless (-c $mycfg{serial_port_file}) {
+			syslog(LOG_ERR, qq^Path "$mycfg{serial_port_file}" in config key 'serial_port_file' is not char device.^);
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'serial_port_file' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{serial_port_speed})) {
+		unless ($mycfg{serial_port_speed} eq '2400' || $mycfg{serial_port_speed} eq '4800' || $mycfg{serial_port_speed} eq '9600' ||
+                        $mycfg{serial_port_speed} eq '19200' || $mycfg{serial_port_speed} eq '38400') {
+			syslog(LOG_ERR, "Config key 'serial_port_speed' has bad value: '$mycfg{serial_port_speed}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'serial_port_speed' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{broadcast_period})) {
+		if ($mycfg{broadcast_period} !~ /^\d{1,3}$/ || $mycfg{broadcast_period} =~ /^0/ ||
+                    $mycfg{broadcast_period} < 2 || $mycfg{broadcast_period} > 600) {
+			syslog(LOG_ERR, "Config key 'broadcast_period' has bad value: '$mycfg{broadcast_period}'.");
+			error_exit();
+		} else {
+			$bcast_period_s_tmo = $mycfg{broadcast_period};
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'broadcast_period' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{start_unicasts_delay})) {
+		if ($mycfg{start_unicasts_delay} !~ /^\d{2,4}$/ || $mycfg{start_unicasts_delay} =~ /^0/ || $mycfg{start_unicasts_delay} > 3600) {
+			syslog(LOG_ERR, "Config key 'start_unicasts_delay' has bad value: '$mycfg{start_unicasts_delay}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'start_unicasts_delay' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{next_unicasts_delay})) {
+		if ($mycfg{next_unicasts_delay} !~ /^\d{2,4}$/ || $mycfg{next_unicasts_delay} =~ /^0/ || $mycfg{next_unicasts_delay} < 10 ||
+                    $mycfg{next_unicasts_delay} > 3600) {
+			syslog(LOG_ERR, "Config key 'next_unicasts_delay' has bad value: '$mycfg{next_unicasts_delay}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'next_unicasts_delay' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{node_data_queue_size})) {
+		if ($mycfg{node_data_queue_size} !~ /^\d{2}$/ || $mycfg{node_data_queue_size} =~ /^0/) {
+			syslog(LOG_ERR, "Config key 'node_data_queue_size' has bad value: '$mycfg{node_data_queue_size}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'node_data_queue_size' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{send_mesg_renice})) {
+		if ($mycfg{send_mesg_renice} !~ /^\d{1,2}$/ || $mycfg{send_mesg_renice} =~ /^0\d/ || $mycfg{send_mesg_renice} > 20) {
+			syslog(LOG_ERR, "Config key 'send_mesg_renice' has bad value: '$mycfg{send_mesg_renice}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'send_mesg_renice' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{transmit_gain})) {
+		if ($mycfg{transmit_gain} !~ /^\d$/ || $mycfg{transmit_gain} > 7) {
+			syslog(LOG_ERR, "Config key 'transmit_gain' has bad value: '$mycfg{transmit_gain}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'transmit_gain' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{operation_band})) {
+		if ($mycfg{operation_band} eq 'FCC') {
+			$module{op_band} = YIT_OP_BAND_FCC;
+			$module{region} = YIT_REGION_FCC;
+		} elsif ($mycfg{operation_band} eq 'CA') {
+			$module{op_band} = YIT_OP_BAND_CA;
+			$module{region} = YIT_REGION_CA;
+		} elsif ($mycfg{operation_band} eq 'CB') {
+			$module{op_band} = YIT_OP_BAND_CB;
+			$module{region} = YIT_REGION_CB;
+		} elsif ($mycfg{operation_band} eq 'CA3') {
+			$module{op_band} = YIT_OP_BAND_CA3;
+			$module{region} = YIT_REGION_CA3;
+		} elsif ($mycfg{operation_band} eq 'ARIB') {
+			$module{op_band} = YIT_OP_BAND_ARIB;
+			$module{region} = YIT_REGION_ARIB;
+		} else {
+			syslog(LOG_ERR, "Config key 'operation_band' has bad value: '$mycfg{operation_band}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'operation_band' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{yi_network_size})) {
+		if ($mycfg{yi_network_size} !~ /^\d{1,5}$/ || $mycfg{yi_network_size} =~ /^0/ || $mycfg{yi_network_size} < 5 ||
+                    $mycfg{yi_network_size} > 65535) {
+			syslog(LOG_ERR, "Config key 'yi_network_size' has bad value: '$mycfg{yi_network_size}'.");
+			error_exit();
+		} else {
+			${$nc_module_config[get_idx_by_key(\@nc_module_config, 'network_size')]}{v} = $mycfg{yi_network_size};
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'yi_network_size' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{yi_max_network_depth})) {
+		if ($mycfg{yi_max_network_depth} !~ /^\d{1,2}$/ || $mycfg{yi_max_network_depth} =~ /^0/ || $mycfg{yi_max_network_depth} < 2 ||
+                    $mycfg{yi_max_network_depth} > 16) {
+			syslog(LOG_ERR, "Config key 'yi_max_network_depth' has bad value: '$mycfg{yi_max_network_depth}'.");
+			error_exit();
+		} else {
+			${$nc_module_config[get_idx_by_key(\@nc_module_config, 'max_network_depth')]}{v} = $mycfg{yi_max_network_depth};
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'yi_max_network_depth' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{yi_nc_database_size})) {
+		if ($mycfg{yi_nc_database_size} !~ /^\d{1,4}$/ || $mycfg{yi_nc_database_size} =~ /^0/ || $mycfg{yi_nc_database_size} < 2 ||
+                    $mycfg{yi_nc_database_size} > 1400) {
+			syslog(LOG_ERR, "Config key 'yi_nc_database_size' has bad value: '$mycfg{yi_nc_database_size}'.");
+			error_exit();
+		} else {
+			${$nc_module_config[get_idx_by_key(\@nc_module_config, 'nc_database_size')]}{v} = $mycfg{yi_nc_database_size};
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'yi_nc_database_size' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{yi_uart_rate})) {
+		if ($mycfg{yi_uart_rate} eq '240' || $mycfg{yi_uart_rate} eq '480' || $mycfg{yi_uart_rate} eq '960' ||
+                    $mycfg{yi_uart_rate} eq '1920' || $mycfg{yi_uart_rate} eq '3840') {
+			${$nc_module_config[get_idx_by_key(\@nc_module_config, 'uart_rate')]}{v} = $mycfg{yi_uart_rate};
+		} else {
+			syslog(LOG_ERR, "Config key 'yi_uart_rate' has bad value: '$mycfg{yi_uart_rate}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'yi_uart_rate' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{data_integrity})) {
+		unless ($mycfg{data_integrity} eq '0' || $mycfg{data_integrity} eq '1') {
+			syslog(LOG_ERR, "Config key 'data_integrity' has bad value: '$mycfg{data_integrity}'.");
+			error_exit();
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'data_integrity' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{default_broadcast_data})) {
+		unless ($mycfg{default_broadcast_data} =~ /^\s*($hex_str_rex)\s*$/) {
+			syslog(LOG_ERR, "Config key 'default_broadcast_data' has bad value: '$mycfg{default_broadcast_data}'.");
+			error_exit();
+		} else {
+			hex_str_to_ary(\@bcdata, $1, 0);
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'default_broadcast_data' was not found.^);
+		error_exit();
+	}
+	if (exists($mycfg{default_unicast_data})) {
+		unless ($mycfg{default_unicast_data} =~ /^\s*($hex_str_rex)\s*$/) {
+			syslog(LOG_ERR, "Config key 'default_unicast_data' has bad value: '$mycfg{default_unicast_data}'.");
+			error_exit();
+		} else {
+			$mycfg{default_unicast_data} = $1;
+		}
+	} else {
+		syslog(LOG_ERR, q^Config key 'default_unicast_data' was not found.^);
+		error_exit();
+	}
+}
+
+sub parse_rscfg {
+	local $_;
+	my ($fn, $fh) = "/etc/$I" . '-rs.conf';
+
+	unless (open($fh, '<', $fn)) {
+		syslog(LOG_ERR, qq^Can't open file "$fn". System error: $!.^);
+		error_exit();
+	}
+	while (<$fh>) {
+		chomp();
+		next if (m!^\s*#|^\s*$!);
+		if (/^\s*($sn_rex)\s*$/) {
+			my ($sn, $s) = uc($1);
+			if (exists($rsdb{$sn})) {
+				syslog(LOG_ERR, qq^Duplicated S/N on line $. in file "$fn".^);
+				error_exit();
+			}
+			$s = $sn;
+			for (my $i = 0; $i < 16; $i++) {
+				my $h = chop($s);
+				$h = chop($s) . $h;
+				$rsdb{$sn}->{sn_ary}->[$i] = hex($h);
+			}
+			$rsdb{$sn}->{admitted} = 0;
+			$rsdb{$sn}->{connected} = 0;
+			$rsdb{$sn}->{node_id} = 0;
+			$rsdb{$sn}->{parent_id} = 0;
+			$rsdb{$sn}->{unicast_cnt} = 0;
+			$rsdb{$sn}->{ucast_time} = 0;
+			$rsdb{$sn}->{ucast_pending} = 0;
+			$rsdb{$sn}->{ucast_session} = 0;
+			$rsdb{$sn}->{ucast_once} = 0;
+			$rsdb{$sn}->{session_1_tmo_cnt} = 0;
+			$rsdb{$sn}->{session_tmo_cnt} = 0;
+			$rsdb{$sn}->{transmit_gain} = $mycfg{transmit_gain};
+			$rsdb{$sn}->{txp_adm_err_cnt} = 0;
+			$rsdb{$sn}->{txp_trn_err_cnt} = 0;
+			$rsdb{$sn}->{admission_cnt} = 0;
+			$rsdb{$sn}->{rxp_ord_err_cnt} = 0;
+			$rsdb{$sn}->{rxp_tag_err_cnt} = 0;
+			$rsdb{$sn}->{rxp_crc_err_cnt} = 0;
+			@{$rsdb{$sn}->{unicast_once_data}} = ();
+			@{$rsdb{$sn}->{unicast_data}} = ();
+			hex_str_to_ary($rsdb{$sn}->{unicast_data}, $mycfg{default_unicast_data}, 0);
+			@{$rsdb{$sn}->{recv_data_ref_fifo}} = ();
+			$rsdb{$sn}->{recv_rpl_tms} = 0;
+			$rsdb{$sn}->{rx_sig_qual} = 0;
+		} else {
+			syslog(LOG_ERR, qq^Wrong format of line $. in file "$fn": ($_).^);
+			error_exit();
+		}
+	}
+	if ($. == 0) {
+		syslog(LOG_ERR, qq^Config file "$fn" is empty.^);
+		error_exit();
+	}
+	unless (close($fh)) {
+		syslog(LOG_ERR, qq^Can't close file "$fn". System error: $!.^);
+		error_exit();
+	}
+	my $rsn = keys(%rsdb);
+}
+
+sub VERSION_MESSAGE {
+	my $r_fh = shift();
+
+	print $r_fh ("$VERSION.\n");
+}
+
+sub HELP_MESSAGE {
+	my $r_fh = shift();
+
+	print $r_fh ("\nOptions:\n");
+	print $r_fh ("\t-m        terminal mode\n\n");
+	print $r_fh ("\t-c        cold start\n\n");
+	print $r_fh ("\t-v 0|1|2  logging level\n\n");
+	print $r_fh ("\t-h        print help\n\n");
+	print $r_fh ("\t-p        print default config to STDOUT\n\n");
+	print $r_fh ("\t-r        clear node database\n\n");
+	print $r_fh ("Exit status:\n");
+	print $r_fh ("\t0         if OK,\n\n");
+	print $r_fh ("\t1         if error, or -h -p.\n\n");
+}
+
+sub cmd_opt_comb_err {
+	my ($r_opts, $sw) = shift();
+
+	foreach (keys(%{$r_opts})) {
+		$sw .= " -$_";
+	}
+	syslog(LOG_ERR, "Illegal combination of command line options:$sw.");
+}
+
+sub parse_options {
+	my (%opts, $res, $err, $m);
+
+	$Getopt::Std::STANDARD_HELP_VERSION = 1;
+	{
+		unless (open(local(*STDERR), '>', \$err)) {
+			syslog(LOG_ERR, "Can't open STDERR to string in parse_options(). System error: $!.");
+			error_exit();
+		}
+		$res = getopts('hpv:mcr', \%opts);
+	}
+	if (!$res && defined($err)) {
+		my $s = '';
+		foreach ($err =~ /^[[:alpha:] ]+:\s*(\S)\s*$/mg) {
+			$s .= " -$_,";
+		}
+		chop($s);
+		syslog(LOG_ERR, 'Unknown command line ' . (length($s) > 3  ? 'options' : 'option') . ":$s.");
+		error_exit();
+	}
+	if (!$res) {
+		syslog(LOG_ERR, 'Parsing of command line options failed.');
+		error_exit();
+	}
+	if (exists($opts{h})) {
+		if (keys(%opts) == 1) {
+			VERSION_MESSAGE(\*STDOUT);
+			HELP_MESSAGE(\*STDOUT);
+		} else {
+			cmd_opt_comb_err(\%opts);
+		}
+		error_exit();
+	}
+	if (exists($opts{p})) {
+		if (keys(%opts) == 1) {
+			print("# Default $I config (/etc/$I.conf).\n");
+			foreach ($mycfg_keys_def =~ /^\s*$mycfg_key_rex\s*#\s*(.*)$/mg) {
+				print("$_\n");
+			}
+		} else {
+			cmd_opt_comb_err(\%opts);
+		}
+		error_exit();
+	}
+	if (exists($opts{v})) {
+		if (!defined($opts{v}) || $opts{v} !~ /^\d$/ || $opts{v} > 2) {
+			syslog(LOG_ERR, q^Bad argument of command line option 'v'.^);
+			error_exit();
+		} else {
+			$dbg = $opts{v};
+		}
+	}
+	if (exists($opts{m})) {
+		$daemon = FALSE;
+	}
+	if (exists($opts{c})) {
+		${$nc_module_config[get_idx_by_key(\@nc_module_config, 'warm_start_enabled')]}{v} = 0;
+	}
+	if (exists($opts{r})) {
+		$clear_ndbase = TRUE;
+	}
+}
+
+sub quote_percent {
+	my $str = reverse($_[0]);
+	my ($ln, $res) = length($str);
+
+	for (my $i = 0; $i < $ln; $i++) {
+		my $c;
+		if (($c = chop($str)) eq '%') {
+			$res .= '%';
+		}
+		$res .= $c;
+	}
+	return $res;
+}
+
+sub syslog {
+	if ($proc_type == PARENT_PROCESS) {
+		if ($_[0] == LOG_INFO) {
+			print($term_out ? "\n$_[1]" : $_[1]);
+		} else {
+			print STDERR ($term_out ? "\n$_[1]" : $_[1]);
+		}
+		$term_out = TRUE if (!$term_out);
+	}
+	c_sd_journal_send('MESSAGE=' . (index($_[1], '%') == -1 ? $_[1] : quote_percent($_[1])) . "\0",
+                          'SYSLOG_IDENTIFIER=' . $I . "\0",
+ 			  'PRIORITY=' . $_[0] . "\0");
+}
+
+sub error_exit {
+	if ($proc_type == PARENT_PROCESS && $init_ok) {
+		syslog(LOG_ERR, 'Terminated due to error conditions.');
+	}
+	exit(1);
+}
+
+END {
+	if (defined($c_sock)) {
+		close($c_sock) || syslog(LOG_ERR, qq^Can't close client socket "$socket". System error: $!.^);
+	}
+	if (defined($s_sock)) {
+		close($s_sock) || syslog(LOG_ERR, qq^Can't close server socket "$socket". System error: $!.^);
+	}
+	if (defined($port)) {
+		close($port) || syslog(LOG_ERR, qq^Can't close file "$mycfg{serial_port_file}". System error: $!.^);
+	}
+	if (defined($pid_fh)) {
+		close($pid_fh) || syslog(LOG_ERR, qq^Can't close file "$pid_file". System error: $!.^);
+	}
+	if ($proc_type == CHILD_PROCESS) {
+		syslog(LOG_ERR, 'Daemon terminated due to error conditions.') if ($? != 0);
+	} else {
+		print("\n") if ($term_out);
+	}
+}
+
+__DATA__
+__C__
+#include <unistd.h>
+#include <sys/ioctl.h>
+
+int c_getsid(int pid)
+{
+	return (getsid(pid));
+}
+
+int TCFLSH_constant()
+{
+	return (TCFLSH);
+}
+
+__C__
+#include <systemd/sd-journal.h>
+#include <syslog.h>
+
+int LOG_INFO_constant()
+{
+	return (LOG_INFO);
+}
+
+int LOG_ERR_constant()
+{
+	return (LOG_ERR);
+}
+
+int c_sd_journal_send(char *msg, char *prog, char *prio)
+{
+	return (sd_journal_send(msg, prog, prio, (void *) 0));
+}

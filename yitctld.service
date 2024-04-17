@@ -1,0 +1,13 @@
+[Unit]
+Description=YITRAN network control daemon
+
+[Service]
+Type=forking
+KillMode=process
+PIDFile=/run/yitctld/pid
+ExecStart=/usr/local/sbin/yitctld
+ExecStartPre=/bin/mkdir -p /run/yitctld
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
